@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+data/
+raw/
+*.sqlite3
+*.sqlite3-*
+*.xlsx
+*.csv
+!static/sample_import_template.csv
+.env
+playwright/.auth/
+browser-profile/

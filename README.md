@@ -22,6 +22,10 @@ On macOS/Linux, create a virtual environment, install `requirements.txt`, set `A
 5. Paste product information into **Product Fit**. The local rules detect a controlled set of features and compare them with collected listing titles. Missing title evidence is marked unverified, not treated as proof a competitor lacks the feature.
 6. Export the current local dataset and recent feature comparisons to Excel.
 
+## SellerSprite authorized browser connector
+
+AM master can open a visible dedicated Edge session for SellerSprite. Enter credentials only in SellerSprite's own login page; AM master does not receive or store the password. The local browser profile is stored under the configured data directory. Paste an authorized competitor or market-results URL to read up to 100 unique visible products and save the displayed units, revenue, price, rating and review count. The connector does not click paid export actions, bypass CAPTCHAs, or continue past an access-control challenge.
+
 ## Import columns
 
 Recognized columns include country, category path (three levels recommended), ASIN/product ID, title, brand, price, currency, monthly units, monthly revenue, growth percent, rating, review count, image URL, and product URL. Sales metrics retain the values supplied in the imported file; note the source period and measurement basis in the source file and do not combine different periods without normalizing them.

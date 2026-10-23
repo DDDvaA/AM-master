@@ -1,0 +1,20 @@
+.connector-panel {
+  grid-column: 1 / -1;
+}
+
+.connector-panel > label {
+  margin: 12px 0;
+}
+
+.connector-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 700px) {
+  .connector-actions .button {
+    width: 100%;
+  }
+}

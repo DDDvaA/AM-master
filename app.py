@@ -21,6 +21,9 @@ from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
+from sellersprite_connector import open_login as sellersprite_open_login
+from sellersprite_connector import sync_results as sellersprite_sync_results
+from sellersprite_connector import validate_sellersprite_url
 
 
 ROOT = Path(__file__).resolve().parent
@@ -29,11 +32,14 @@ DEFAULT_DATA = Path(r"D:\AM-master-data") if os.name == "nt" else ROOT / "data"
 DATA_DIR = Path(os.environ.get("AM_MASTER_DATA_DIR", str(DEFAULT_DATA))).expanduser()
 DB_PATH = DATA_DIR / "am_master.sqlite3"
 RAW_DIR = DATA_DIR / "raw"
+SELLERSPRITE_PROFILE_DIR = DATA_DIR / "browser-profile" / "sellersprite"
 PORT = int(os.environ.get("AM_MASTER_PORT", "8777"))
 MAX_PRODUCTS_PER_MARKET = 100
 MAX_SEARCH_PAGES = 10
 _DB_INIT_LOCK = threading.Lock()
 _INITIALIZED_DATABASES = set()
+_CONNECTOR_LOCK = threading.Lock()
+_CONNECTOR_RUNS = {}
 COUNTRIES = {
     "US": ("美国", "www.amazon.com", "USD", "en-US,en;q=0.9"),
     "CA": ("加拿大", "www.amazon.ca", "CAD", "en-CA,en;q=0.9"),
@@ -89,6 +95,11 @@ def connect():
                   CREATE TABLE IF NOT EXISTS analyses(
                     id TEXT PRIMARY KEY, product_name TEXT NOT NULL, category_path TEXT NOT NULL,
                     product_text TEXT NOT NULL, created_at TEXT NOT NULL, result_json TEXT NOT NULL
+                  );
+                  CREATE TABLE IF NOT EXISTS connector_runs(
+                    id TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL,
+                    started_at TEXT NOT NULL, finished_at TEXT, message TEXT NOT NULL DEFAULT '',
+                    result_json TEXT NOT NULL DEFAULT '{}'
                   );
                 """)
                 columns = {row[1] for row in con.execute("PRAGMA table_info(products)")}
@@ -544,6 +555,65 @@ def json_bytes(value):
     return json.dumps(value, ensure_ascii=False, default=str).encode("utf-8")
 
 
+def connector_snapshot(run_id):
+    with _CONNECTOR_LOCK:
+        return dict(_CONNECTOR_RUNS.get(run_id, {}))
+
+
+def update_connector(run_id, **values):
+    with _CONNECTOR_LOCK:
+        run = _CONNECTOR_RUNS.setdefault(run_id, {})
+        run.update(values)
+        snapshot = dict(run)
+    con = connect()
+    con.execute(
+        "UPDATE connector_runs SET status=?,finished_at=?,message=?,result_json=? WHERE id=?",
+        (snapshot.get("status", "RUNNING"), snapshot.get("finished_at"), snapshot.get("message", ""), json.dumps(snapshot.get("result", {}), ensure_ascii=False), run_id),
+    )
+    con.commit(); con.close()
+
+
+def active_connector_run():
+    with _CONNECTOR_LOCK:
+        return next((dict(run) for run in _CONNECTOR_RUNS.values() if run.get("status") == "RUNNING"), None)
+
+
+def create_connector_run(kind, target):
+    if active_connector_run():
+        raise RuntimeError("已有卖家精灵任务正在运行，请等待完成或关闭其浏览器窗口。")
+    run_id = uuid.uuid4().hex
+    started_at = datetime.now(timezone.utc).isoformat()
+    run = {"id":run_id,"kind":kind,"status":"RUNNING","started_at":started_at,"message":"准备启动","page":0,"count":0,"result":{}}
+    with _CONNECTOR_LOCK:
+        _CONNECTOR_RUNS[run_id] = run
+    con=connect(); con.execute("INSERT INTO connector_runs(id,kind,status,started_at,message,result_json) VALUES(?,?,?,?,?,?)",(run_id,kind,"RUNNING",started_at,"准备启动","{}")); con.commit(); con.close()
+    threading.Thread(target=target,args=(run_id,),daemon=True).start()
+    return run
+
+
+def execute_sellersprite_login(run_id):
+    def progress(message, page, count):
+        update_connector(run_id,message=message,page=page,count=count)
+    try:
+        result=sellersprite_open_login(SELLERSPRITE_PROFILE_DIR,progress)
+        update_connector(run_id,status="COMPLETED",finished_at=datetime.now(timezone.utc).isoformat(),message="卖家精灵登录会话已保存在本机",result=result)
+    except Exception as exc:
+        update_connector(run_id,status="FAILED",finished_at=datetime.now(timezone.utc).isoformat(),message=str(exc),result={"error":str(exc)})
+
+
+def execute_sellersprite_sync(run_id, url, category_path, max_products):
+    def progress(message, page, count):
+        update_connector(run_id,message=message,page=page,count=count)
+    try:
+        rows=sellersprite_sync_results(url,category_path,SELLERSPRITE_PROFILE_DIR,max_products,progress)
+        saved=save_products(rows)
+        countries=sorted({row["country"] for row in rows})
+        result={"saved":saved,"countries":countries,"unique_products":len(rows)}
+        update_connector(run_id,status="COMPLETED",finished_at=datetime.now(timezone.utc).isoformat(),message=f"同步完成，保存 {saved} 个去重商品",count=len(rows),result=result)
+    except Exception as exc:
+        update_connector(run_id,status="FAILED",finished_at=datetime.now(timezone.utc).isoformat(),message=str(exc),result={"error":str(exc)})
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(f"[{self.log_date_time_string()}] {fmt % args}")
@@ -568,6 +638,13 @@ class Handler(BaseHTTPRequestHandler):
             rows=[dict(x) for x in con.execute(sql,args)]; con.close(); return self.send_json({"items":opportunity_tags(rows)})
         if path == "/api/categories":
             con=connect(); values=[r[0] for r in con.execute("SELECT DISTINCT category_path FROM products WHERE category_path<>'' ORDER BY category_path")]; con.close(); return self.send_json({"items":values})
+        if path == "/api/sellersprite/status":
+            return self.send_json({"profile_ready":(SELLERSPRITE_PROFILE_DIR / ".logged_in").exists(),"profile_dir":str(SELLERSPRITE_PROFILE_DIR),"active_run":active_connector_run()})
+        if path == "/api/sellersprite-run":
+            run_id=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("id",[""])[0]
+            run=connector_snapshot(run_id)
+            if not run: return self.send_json({"error":"找不到该卖家精灵任务"},404)
+            return self.send_json(run)
         if path == "/api/search-run":
             run_id=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("id",[""])[0]
             con=connect(); row=con.execute("SELECT * FROM searches WHERE id=?",(run_id,)).fetchone(); con.close()
@@ -609,6 +686,14 @@ class Handler(BaseHTTPRequestHandler):
                 if not name or not specs: return self.send_json({"error":"产品名称和产品资料都必填"},400)
                 if not countries: return self.send_json({"error":"至少选择一个对照市场"},400)
                 result=compare_product(name,specs,category,countries); analysis_id=uuid.uuid4().hex; con=connect(); con.execute("INSERT INTO analyses VALUES(?,?,?,?,?,?)",(analysis_id,name,category,specs,result["created_at"],json.dumps(result,ensure_ascii=False))); con.commit(); con.close(); return self.send_json({"id":analysis_id,**result})
+            if path == "/api/sellersprite/login":
+                run=create_connector_run("sellersprite_login",execute_sellersprite_login)
+                return self.send_json(run,202)
+            if path == "/api/sellersprite/sync":
+                url=str(data.get("url","")).strip(); category=str(data.get("category_path","")).strip(); maximum=int(data.get("max_products",100) or 100)
+                validate_sellersprite_url(url)
+                run=create_connector_run("sellersprite_sync",lambda run_id: execute_sellersprite_sync(run_id,url,category,maximum))
+                return self.send_json(run,202)
             return self.send_error(404)
         except Exception as exc:
             return self.send_json({"error":str(exc)},500)

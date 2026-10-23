@@ -170,6 +170,51 @@ async function importFile(file) {
   } catch (err) { $("importNotice").textContent = `导入失败：${err.message}`; }
 }
 
+function showSellerNotice(message, error = false) {
+  const node = $("sellerNotice");
+  node.classList.remove("hidden", "error");
+  if (error) node.classList.add("error");
+  node.textContent = message;
+}
+
+async function waitForConnector(runId) {
+  let run;
+  do {
+    run = await api(`/api/sellersprite-run?id=${encodeURIComponent(runId)}`);
+    showSellerNotice(`${run.message}${run.page ? ` · 第 ${run.page} 页` : ""}${run.count ? ` · ${run.count} 条` : ""}`, run.status === "FAILED");
+    if (run.status === "RUNNING") await new Promise((resolve)=>setTimeout(resolve,1000));
+  } while (run.status === "RUNNING");
+  if (run.status === "FAILED") throw new Error(run.message);
+  await refresh();
+  return run;
+}
+
+async function sellerLogin() {
+  const button = $("sellerLoginBtn"); button.disabled = true;
+  try {
+    const run = await api("/api/sellersprite/login", {method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
+    showSellerNotice("正在打开专用 Edge。请只在卖家精灵页面中输入账号、密码和验证码。", false);
+    await waitForConnector(run.id);
+    $("sellerProfileState").textContent = "登录会话已保存在本机";
+  } catch (err) { showSellerNotice(err.message, true); }
+  finally { button.disabled = false; }
+}
+
+async function sellerSync() {
+  const button = $("sellerSyncBtn"); button.disabled = true;
+  try {
+    const run = await api("/api/sellersprite/sync", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:$("sellerUrl").value.trim(),category_path:$("sellerCategory").value.trim(),max_products:100})});
+    await waitForConnector(run.id);
+  } catch (err) { showSellerNotice(err.message, true); }
+  finally { button.disabled = false; }
+}
+
+async function refreshSellerState() {
+  const state = await api("/api/sellersprite/status");
+  $("sellerProfileState").textContent = state.profile_ready ? "本机会话目录已建立" : "首次使用请打开登录窗口";
+  if (state.active_run) showSellerNotice(state.active_run.message, false);
+}
+
 document.querySelectorAll(".nav-item").forEach((button)=>button.addEventListener("click",()=>{
   document.querySelectorAll(".nav-item").forEach((x)=>x.classList.toggle("active",x===button));
   document.querySelectorAll(".view").forEach((x)=>x.classList.toggle("active",x.id===`view-${button.dataset.view}`));
@@ -180,6 +225,7 @@ $("analyzeBtn").addEventListener("click",analyze); $("countryFilter").addEventLi
 $("refreshBtn").addEventListener("click",()=>refresh().catch((e)=>showNotice(e.message,true)));
 for (const id of ["exportBtn","exportBtn2"]) $(id).addEventListener("click",()=>{window.location.href=`/api/export.xlsx${activeCategory?`?category=${encodeURIComponent(activeCategory)}`:""}`;});
 $("fileInput").addEventListener("change",(e)=>importFile(e.target.files[0]));
+$("sellerLoginBtn").addEventListener("click",sellerLogin); $("sellerSyncBtn").addEventListener("click",sellerSync);
 $("dropZone").addEventListener("dragover",(e)=>{e.preventDefault();});
 $("dropZone").addEventListener("drop",(e)=>{e.preventDefault();importFile(e.dataTransfer.files[0]);});
-refresh().catch((err)=>{ $("dbCount").textContent="服務未連線"; showNotice(err.message,true); });
+Promise.all([refresh(),refreshSellerState()]).catch((err)=>{ $("dbCount").textContent="服務未連線"; showNotice(err.message,true); });

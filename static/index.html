@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AM master | 多国家产品机会与竞品研究</title>
   <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/connector.css">
 </head>
 <body>
   <div class="app-shell">
@@ -66,6 +67,7 @@
           <div class="data-grid">
           <section class="query-panel"><div class="query-title"><span class="step">A</span><div><h2>导入数据文件</h2><small>支持 SellerSprite 和自有市场数据</small></div></div><div class="drop-zone" id="dropZone"><div class="upload-icon">↑</div><strong>选择 CSV 或 Excel 文件</strong><span>支持 .csv、.xlsx、.xlsm</span><input type="file" id="fileInput" accept=".csv,.xlsx,.xlsm"></div><p class="fineprint">识别国家、三级类目、ASIN、标题、价格、销量、销售额、增长率、评分、评论数和图片链接。未映射列不会推断。<a href="/static/sample_import_template.csv" download>下载导入模板</a></p><div id="importNotice" class="import-notice"></div></section>
             <section class="query-panel data-status"><div class="query-title"><span class="step">B</span><div><h2>本机存储</h2><small>数据库和原始页面均留在本机</small></div></div><dl><div><dt>数据目录</dt><dd id="dataPath">--</dd></div><div><dt>商品记录</dt><dd id="dataProducts">0</dd></div><div><dt>已覆盖国家</dt><dd id="dataCountries">0 / 7</dd></div><div><dt>最近更新</dt><dd id="dataLatest">--</dd></div></dl><div class="privacy-note">无 token / 云推理调用。公开页面访问可能受站点限制；遇到验证码、登录墙或拦截时会停止并记录，不绕过访问控制。</div></section>
+            <section class="query-panel connector-panel"><div class="query-title"><span class="step">C</span><div><h2>卖家精灵授权同步</h2><small>使用独立可见浏览器和本机会话，不保存账号密码</small></div></div><div class="connector-actions"><button class="button secondary" id="sellerLoginBtn">打开登录窗口</button><span id="sellerProfileState" class="helper">尚未检查登录会话</span></div><label>卖家精灵结果页 URL<input id="sellerUrl" placeholder="粘贴查竞品或选市场结果页的完整 https 地址"></label><label>三级分类<input id="sellerCategory" placeholder="例如：宠物用品 > 猫用品 > 自动喂食器"></label><div class="connector-actions"><button class="button primary" id="sellerSyncBtn">同步最多 100 个去重商品</button><span class="helper">只读取你有权限查看的页面，不点击付费导出。</span></div><div id="sellerNotice" class="run-notice hidden"></div><p class="fineprint">首次登录时请在弹出的 Edge 中自行输入账号、密码和验证码。会话保存在 D 盘本地浏览器配置中；遇到安全验证会暂停，不绕过访问控制。</p></section>
           </div>
           <div class="section-heading"><div><h2>缓存商品</h2><p>图片取自来源页面，原始页面快照保存在配置的数据目录。</p></div></div>
           <div class="table-wrap"><table><thead><tr><th>商品</th><th>国家</th><th>三级分类</th><th>价格</th><th>销量</th><th>销售额</th><th>评分</th><th>来源</th></tr></thead><tbody id="dataRows"><tr><td colspan="8" class="empty-cell">还没有缓存记录</td></tr></tbody></table></div>

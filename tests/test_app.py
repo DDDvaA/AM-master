@@ -12,9 +12,27 @@ TEMP_DATA = tempfile.TemporaryDirectory()
 os.environ["AM_MASTER_DATA_DIR"] = TEMP_DATA.name
 
 import app
+import sellersprite_connector
 
 
 class AnalysisTests(unittest.TestCase):
+    def test_sellersprite_card_parser_extracts_authorized_metrics(self):
+        text = "A+ V AC Yuposl Automatic Cat Feeder, 3L Cat Food Dispenser B0FCM74WM2 FBA 卖家: 2 卖家: Petfit Home CA 品牌: Yuposl #204 in Pet Supplies #1 in Automatic Cat Feeders 销量(父): 2,023 子体销量: 1K+ 销售额: C$91,075 变体数: 7 价格: C$47.99 评分/评分数: 4.3 / 4,760 上架时间: 2025-08-14"
+        row = sellersprite_connector.parse_card_text(text, "https://www.amazon.ca/dp/B0FCM74WM2")
+        self.assertEqual("B0FCM74WM2", row["asin"])
+        self.assertEqual("Yuposl", row["brand"])
+        self.assertEqual(2023.0, row["units"])
+        self.assertEqual(91075.0, row["revenue"])
+        self.assertEqual(47.99, row["price"])
+        self.assertEqual(4.3, row["rating"])
+        self.assertEqual(4760.0, row["reviews"])
+
+    def test_sellersprite_url_requires_supported_market(self):
+        _parsed, market = sellersprite_connector.validate_sellersprite_url("https://www.sellersprite.com/v3/competitor-lookup/?market=CA&page=1")
+        self.assertEqual("CA", market)
+        with self.assertRaises(ValueError):
+            sellersprite_connector.validate_sellersprite_url("https://example.com/v3/competitor-lookup/?market=CA")
+
     def test_feature_extraction_is_deterministic(self):
         result = app.extract_features("双粮仓 WiFi 定时定量喂食，摄像头支持夜视")
         self.assertTrue(result["双仓/多仓"]["present"])

@@ -1,6 +1,11 @@
 import os
 import tempfile
 import unittest
+import json
+import threading
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
 
 TEMP_DATA = tempfile.TemporaryDirectory()
 os.environ["AM_MASTER_DATA_DIR"] = TEMP_DATA.name
@@ -50,6 +55,60 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(("DE", "B012345678", 240.0, 19197.6), tuple(row))
         workbook = app.export_xlsx("Pet > Cat > Automatic feeder")
         self.assertGreater(len(workbook), 1000)
+
+
+class HttpValidationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), app.ExportHandler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base_url = f"http://127.0.0.1:{cls.server.server_port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join()
+
+    def test_static_traversal_is_rejected(self):
+        request = urllib.request.Request(f"{self.base_url}/static/../app.py")
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request)
+        self.assertEqual(404, error.exception.code)
+
+    def test_search_requires_country(self):
+        payload = json.dumps({"keyword": "feeder", "countries": []}).encode()
+        request = urllib.request.Request(f"{self.base_url}/api/search", data=payload, headers={"Content-Type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request)
+        self.assertEqual(400, error.exception.code)
+
+    def test_analysis_requires_country(self):
+        payload = json.dumps({"product_name": "Feeder", "product_text": "WiFi feeder", "countries": []}).encode()
+        request = urllib.request.Request(f"{self.base_url}/api/analyze", data=payload, headers={"Content-Type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request)
+        self.assertEqual(400, error.exception.code)
+
+    def test_local_research_workflow_and_excel_export(self):
+        csv_data = b"Country,Category,ASIN,Title,Price,Currency,Units,Revenue,Growth\nDE,Pet > Cat > Feeders,EXAMPLE0001,Dual hopper WiFi feeder,99,EUR,320,31680,24.5\n"
+        request = urllib.request.Request(f"{self.base_url}/api/import", data=csv_data, headers={"Content-Type": "application/octet-stream", "X-File-Name": "test.csv"})
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(1, json.loads(response.read())["imported"])
+
+        with urllib.request.urlopen(f"{self.base_url}/api/products?country=DE") as response:
+            products = json.loads(response.read())["items"]
+        self.assertTrue(any(row["asin"] == "EXAMPLE0001" for row in products))
+
+        analysis = json.dumps({"product_name": "Test feeder", "product_text": "双粮仓 WiFi 定时喂食", "category_path": "Pet > Cat > Feeders", "countries": ["DE"]}).encode()
+        request = urllib.request.Request(f"{self.base_url}/api/analyze", data=analysis, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request) as response:
+            self.assertTrue(json.loads(response.read())["id"])
+
+        with urllib.request.urlopen(f"{self.base_url}/api/export.xlsx?category=Pet%20%3E%20Cat%20%3E%20Feeders") as response:
+            self.assertEqual("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", response.headers["Content-Type"])
+            self.assertGreater(len(response.read()), 1000)
 
 
 if __name__ == "__main__":

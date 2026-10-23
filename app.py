@@ -24,6 +24,7 @@ from openpyxl.styles import Font, PatternFill
 
 
 ROOT = Path(__file__).resolve().parent
+STATIC = (ROOT / "static").resolve()
 DEFAULT_DATA = Path(r"D:\AM-master-data") if os.name == "nt" else ROOT / "data"
 DATA_DIR = Path(os.environ.get("AM_MASTER_DATA_DIR", str(DEFAULT_DATA))).expanduser()
 DB_PATH = DATA_DIR / "am_master.sqlite3"
@@ -409,7 +410,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/" or path.startswith("/static/"):
             relative="static/index.html" if path == "/" else path.lstrip("/")
             file=(ROOT / relative).resolve()
-            if ROOT not in file.parents and file != ROOT / "static" / "index.html": return self.send_error(404)
+            if STATIC not in file.parents: return self.send_error(404)
             if not file.is_file(): return self.send_error(404)
             body=file.read_bytes(); kind="text/html; charset=utf-8" if file.suffix==".html" else "text/css; charset=utf-8" if file.suffix==".css" else "text/csv; charset=utf-8" if file.suffix==".csv" else "application/javascript; charset=utf-8"
             self.send_response(200); self.send_header("Content-Type",kind); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body); return
@@ -430,12 +431,14 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/search":
                 keyword=str(data.get("keyword","")).strip(); category=str(data.get("category_path","")).strip(); countries=[x for x in data.get("countries",list(COUNTRIES)) if x in COUNTRIES]
                 if not keyword: return self.send_json({"error":"请输入产品名或关键词"},400)
+                if not countries: return self.send_json({"error":"至少选择一个目标国家"},400)
                 run_id=uuid.uuid4().hex; started=datetime.now(timezone.utc).isoformat(); con=connect(); con.execute("INSERT INTO searches(id,keyword,category_path,countries,status,started_at) VALUES(?,?,?,?,?,?)",(run_id,keyword,category,json.dumps(countries),"RUNNING",started)); con.commit(); con.close()
                 thread=threading.Thread(target=execute_search,args=(run_id,keyword,category,countries),daemon=True); thread.start()
                 return self.send_json({"run_id":run_id,"status":"RUNNING","countries":countries})
             if path == "/api/analyze":
                 name=str(data.get("product_name","")).strip(); specs=str(data.get("product_text","")).strip(); category=str(data.get("category_path","")).strip(); countries=[x for x in data.get("countries",list(COUNTRIES)) if x in COUNTRIES]
                 if not name or not specs: return self.send_json({"error":"产品名称和产品资料都必填"},400)
+                if not countries: return self.send_json({"error":"至少选择一个对照市场"},400)
                 result=compare_product(name,specs,category,countries); analysis_id=uuid.uuid4().hex; con=connect(); con.execute("INSERT INTO analyses VALUES(?,?,?,?,?,?)",(analysis_id,name,category,specs,result["created_at"],json.dumps(result,ensure_ascii=False))); con.commit(); con.close(); return self.send_json({"id":analysis_id,**result})
             return self.send_error(404)
         except Exception as exc:

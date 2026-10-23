@@ -23,6 +23,15 @@ function esc(value = "") {
   return String(value).replace(/[&<>"']/g, (ch) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
 }
 
+function safeUrl(value) {
+  try {
+    const url = new URL(value, window.location.href);
+    return ["http:", "https:"].includes(url.protocol) ? url.href : "#";
+  } catch {
+    return "#";
+  }
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, options);
   const contentType = response.headers.get("content-type") || "";
@@ -48,8 +57,8 @@ function tagsMarkup(tags = []) {
 
 function productCell(row) {
   const fallback = "data:image/svg+xml," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="80" height="80"><rect width="100%" height="100%" fill="#f0f3f1"/><path d="M18 58h44M25 52V27h30v25M30 33h20" stroke="#94a69c" fill="none" stroke-width="2"/></svg>');
-  const image = row.image_url ? esc(row.image_url) : fallback;
-  const link = row.product_url ? esc(row.product_url) : "#";
+  const image = row.image_url ? esc(safeUrl(row.image_url)) : fallback;
+  const link = row.product_url ? esc(safeUrl(row.product_url)) : "#";
   return `<div class="product-cell"><img loading="lazy" src="${image}" alt="" onerror="this.src='${fallback}'"><div><a href="${link}" target="_blank" rel="noopener">${esc(row.title || "未命名商品")}</a><small>${esc(row.brand || "品牌未标注")} ${row.asin ? "· " + esc(row.asin) : ""}</small></div></div>`;
 }
 
@@ -129,7 +138,7 @@ function renderAnalysis(result) {
   const featureItems = Object.entries(result.features).filter(([,v])=>v.present).map(([name,v])=>`<div class="feature-item"><strong>${esc(name)}</strong><small>识别证据：${esc(v.evidence.join(" / "))}</small></div>`).join("") || '<div class="feature-item"><strong>未识别到标准功能关键词</strong><small>建议在资料中提供明确的功能描述或规格字段。</small></div>';
   const competitors = result.competitors.map((item)=>{
     const comparisons = item.feature_comparison.map((diff)=>`<div class="diff-row"><b>${esc(diff.feature)}</b><br>${esc(diff.verdict)}${diff.our_evidence.length ? `<br>我方：${esc(diff.our_evidence.join("、"))}` : ""}${diff.competitor_evidence.length ? `<br>页面：${esc(diff.competitor_evidence.join("、"))}` : ""}</div>`).join("");
-    return `<article class="competitor-card">${item.image_url ? `<img src="${esc(item.image_url)}" alt="商品图" loading="lazy">` : '<div class="competitor-placeholder">无图</div>'}<div><h3><a href="${esc(item.product_url || "#")}" target="_blank" rel="noopener">${esc(item.title)}</a></h3><div class="competitor-meta">${esc(item.country)} · ${formatPrice(item)} · ${item.rating ?? "--"} 星 · ${item.reviews ?? "--"} 评 · ${esc(item.asin)}</div><div class="diff-list">${comparisons}</div></div></article>`;
+    return `<article class="competitor-card">${item.image_url ? `<img src="${esc(safeUrl(item.image_url))}" alt="商品图" loading="lazy">` : '<div class="competitor-placeholder">无图</div>'}<div><h3><a href="${esc(safeUrl(item.product_url || "#"))}" target="_blank" rel="noopener">${esc(item.title)}</a></h3><div class="competitor-meta">${esc(item.country)} · ${formatPrice(item)} · ${item.rating ?? "--"} 星 · ${item.reviews ?? "--"} 评 · ${esc(item.asin)}</div><div class="diff-list">${comparisons}</div></div></article>`;
   }).join("");
   $("analysisResults").innerHTML = `<section class="analysis-card"><h3>产品资料识别</h3><p><b>${esc(result.product_name)}</b> · ${esc(result.category_path || "三级类目未填写")}</p><div class="feature-grid">${featureItems}</div></section><section class="analysis-card"><h3>结论与证据边界</h3><p>检索到 <b>${result.competitors.length}</b> 个本地竞品记录。暂可提出的差异线索：${result.supported_differentiators.length ? esc(result.supported_differentiators.join("、")) : "目前没有足够证据证明我方具备竞品稀缺优势；不强行包装优势。"}</p>${result.limitations.map((x)=>`<p>• ${esc(x)}</p>`).join("")}</section><section><div class="section-heading"><div><h2>逐项竞品对照</h2><p>标题未提及只表示缺少页面证据，不代表商品没有该功能。</p></div></div>${competitors || '<div class="analysis-card"><p>当前本机没有所选国家和类目的竞品数据。先到“市场研究”搜索，或导入 SellerSprite 明细，再运行对照。</p></div>'}</section>`;
 }

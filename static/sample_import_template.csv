@@ -1,2 +1,2 @@
 Country,Category,ASIN,Title,Brand,Price,Currency,Units,Revenue,Growth,Rating,Reviews,Image URL,Product URL
-DE,Pet Supplies > Cats > Automatic Feeders,B012345678,Example dual hopper WiFi feeder,Example Brand,99.00,EUR,320,31680,24.5,4.4,168,https://example.com/image.jpg,https://www.amazon.de/dp/B012345678
+DE,Pet Supplies > Cats > Automatic Feeders,EXAMPLE0001,Example dual hopper WiFi feeder,Example Brand,99.00,EUR,320,31680,24.5,4.4,168,https://example.com/image.jpg,https://example.com/product

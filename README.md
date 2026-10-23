@@ -16,7 +16,7 @@ On macOS/Linux, create a virtual environment, install `requirements.txt`, set `A
 ## Research workflow
 
 1. Enter a three-level category path and a product name or search phrase.
-2. Select one or more countries and start a search. Each marketplace continues through result pages until it has up to 100 unique products or no additional products are available. The interface reports page and deduplicated-product progress. A blocked page is recorded as a failure; AM master does not bypass login walls, CAPTCHAs, or access controls.
+2. Select one or more countries and start a search. Each marketplace continues through result pages until it has up to 100 unique products or no additional products are available. Temporary 503, empty, and verification responses are retried with backoff. If normal requests cannot recover, AM master opens a visible dedicated Edge session so the operator can complete any Amazon verification, then resumes from the failed page. Successful page and query snapshots are cached locally; SellerSprite or other authorized records from the exact same country and category can fill remaining gaps. Every cached or authorized row keeps its source label. AM master does not solve CAPTCHAs or bypass access controls.
 3. Import SellerSprite or internal research exports from **Local Data**. CSV/XLSX headers are mapped by common English and Chinese labels. Include a country column using US, CA, UK, DE, FR, IT, or ES.
 4. Products can be tagged as high-growth (growth >= 20%), traffic candidates (units or revenue >= the within-sample 75th percentile), or high-price candidates (price >= the within-sample 75th percentile). These are screening rules, not proof of net profit. Net margin requires cost, fees, ads, returns, and tax inputs.
 5. Paste product information into **Product Fit**. The local rules detect a controlled set of features and compare them with collected listing titles. Missing title evidence is marked unverified, not treated as proof a competitor lacks the feature.
@@ -44,7 +44,7 @@ The app binds only to `127.0.0.1`. Database, imported exports, and raw page snap
 
 ## Known limitations
 
-- Search results can be blocked or change markup. Failed countries are reported; no anti-bot bypass is attempted.
+- Search results can be blocked or change markup. Automatic retry, visible-browser recovery, and local snapshots substantially reduce incomplete runs, but a first-time query cannot be guaranteed to reach 100 if both Amazon and authorized data sources withhold the remaining results. No anti-bot bypass is attempted.
 - Public listing title, price, rating, review count, and images are not a substitute for SellerSprite monthly sales estimates.
 - Feature extraction is deterministic keyword matching. It is a review aid, not semantic understanding or a legal claim substantiation system.
 - “Profit candidate” currently means a high price relative to the selected sample, not verified contribution margin.

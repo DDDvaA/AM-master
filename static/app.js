@@ -122,7 +122,7 @@ async function searchMarkets() {
   const button = $("searchBtn");
   const keyword = $("keyword").value.trim();
   if (!keyword) return showNotice("先填写产品名称或搜索词。", true);
-  button.disabled = true; showNotice("正在逐站尝试公开搜索页。受访问限制的站点会记录失败，不会绕过验证。", false);
+  button.disabled = true; showNotice("正在逐站采集：自动重试临时错误；必要时弹出 Edge 等待人工验证；仍失败则用本机成功快照补齐。", false);
   try {
     const result = await api("/api/search", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({keyword,category_path:categoryPath(),countries:selectedCountries("countryChecks")})});
     let task;

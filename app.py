@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import os
@@ -24,6 +25,7 @@ from openpyxl.styles import Font, PatternFill
 from sellersprite_connector import open_login as sellersprite_open_login
 from sellersprite_connector import sync_results as sellersprite_sync_results
 from sellersprite_connector import validate_sellersprite_url
+from amazon_browser_connector import AmazonBrowserSession
 
 
 ROOT = Path(__file__).resolve().parent
@@ -32,10 +34,14 @@ DEFAULT_DATA = Path(r"D:\AM-master-data") if os.name == "nt" else ROOT / "data"
 DATA_DIR = Path(os.environ.get("AM_MASTER_DATA_DIR", str(DEFAULT_DATA))).expanduser()
 DB_PATH = DATA_DIR / "am_master.sqlite3"
 RAW_DIR = DATA_DIR / "raw"
+AMAZON_CACHE_DIR = DATA_DIR / "cache" / "amazon"
+AMAZON_PROFILE_DIR = DATA_DIR / "browser-profile" / "amazon"
 SELLERSPRITE_PROFILE_DIR = DATA_DIR / "browser-profile" / "sellersprite"
 PORT = int(os.environ.get("AM_MASTER_PORT", "8777"))
 MAX_PRODUCTS_PER_MARKET = 100
 MAX_SEARCH_PAGES = 10
+AMAZON_FETCH_RETRIES = max(1, int(os.environ.get("AM_MASTER_AMAZON_RETRIES", "4")))
+AMAZON_BROWSER_RECOVERY = os.environ.get("AM_MASTER_AMAZON_BROWSER_RECOVERY", "1") != "0"
 _DB_INIT_LOCK = threading.Lock()
 _INITIALIZED_DATABASES = set()
 _CONNECTOR_LOCK = threading.Lock()
@@ -100,6 +106,11 @@ def connect():
                     id TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL,
                     started_at TEXT NOT NULL, finished_at TEXT, message TEXT NOT NULL DEFAULT '',
                     result_json TEXT NOT NULL DEFAULT '{}'
+                  );
+                  CREATE TABLE IF NOT EXISTS amazon_search_cache(
+                    country TEXT NOT NULL, keyword TEXT NOT NULL, category_path TEXT NOT NULL,
+                    products_json TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    PRIMARY KEY(country,keyword,category_path)
                   );
                 """)
                 columns = {row[1] for row in con.execute("PRAGMA table_info(products)")}
@@ -197,6 +208,88 @@ def detect_page_issue(raw):
     if b"captcha" in sample or b"robot check" in sample:
         return "Amazon 返回验证码页面，未绕过验证"
     return "页面可访问，但没有识别到商品；可能是页面结构变化或非商品搜索页"
+
+
+def amazon_page_cache_path(country, keyword, page):
+    digest = hashlib.sha256(f"{country}\n{keyword.strip().lower()}\n{page}".encode("utf-8")).hexdigest()[:24]
+    return AMAZON_CACHE_DIR / country / f"{digest}.json"
+
+
+def save_amazon_page_cache(country, keyword, page, url, raw):
+    path = amazon_page_cache_path(country, keyword, page)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "country": country, "keyword": keyword, "page": page, "url": url,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "html": raw.decode("utf-8", "replace"),
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def load_amazon_page_cache(country, keyword, page):
+    path = amazon_page_cache_path(country, keyword, page)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        raw = str(payload.get("html") or "").encode("utf-8")
+        return (raw, payload.get("fetched_at", "")) if raw else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def load_search_snapshot(country, keyword, category_path):
+    con = connect()
+    row = con.execute(
+        "SELECT products_json,updated_at FROM amazon_search_cache WHERE country=? AND keyword=? AND category_path=?",
+        (country, keyword.strip().lower(), category_path.strip()),
+    ).fetchone()
+    con.close()
+    if not row:
+        return [], ""
+    try:
+        return json.loads(row["products_json"]), row["updated_at"]
+    except (ValueError, TypeError):
+        return [], ""
+
+
+def save_search_snapshot(country, keyword, category_path, rows):
+    rows = deduplicate_products(rows, MAX_PRODUCTS_PER_MARKET)
+    if not rows:
+        return
+    con = connect()
+    existing = con.execute(
+        "SELECT products_json FROM amazon_search_cache WHERE country=? AND keyword=? AND category_path=?",
+        (country, keyword.strip().lower(), category_path.strip()),
+    ).fetchone()
+    existing_count = 0
+    if existing:
+        try:
+            existing_count = len(json.loads(existing["products_json"]))
+        except (ValueError, TypeError):
+            pass
+    if len(rows) >= existing_count:
+        con.execute(
+            "INSERT INTO amazon_search_cache(country,keyword,category_path,products_json,updated_at) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(country,keyword,category_path) DO UPDATE SET products_json=excluded.products_json,updated_at=excluded.updated_at",
+            (country, keyword.strip().lower(), category_path.strip(), json.dumps(rows, ensure_ascii=False), datetime.now(timezone.utc).isoformat()),
+        )
+        con.commit()
+    con.close()
+
+
+def load_authorized_category_products(country, category_path, limit=MAX_PRODUCTS_PER_MARKET):
+    if not category_path.strip():
+        return []
+    con = connect()
+    rows = [dict(row) for row in con.execute(
+        "SELECT * FROM products WHERE country=? AND category_path=? "
+        "AND (source LIKE 'SellerSprite%' OR units IS NOT NULL OR revenue IS NOT NULL) "
+        "ORDER BY COALESCE(units,0) DESC, COALESCE(revenue,0) DESC, source_date DESC LIMIT ?",
+        (country, category_path.strip(), int(limit)),
+    )]
+    con.close()
+    return deduplicate_products(rows, limit)
 
 
 def migrate_product_keys(con):
@@ -330,53 +423,121 @@ def amazon_search(country, keyword, category_path, progress=None):
     seen = set()
     final_url = ""
     empty_pages = 0
-    for page in range(1, MAX_SEARCH_PAGES + 1):
-        query = urllib.parse.urlencode({"k": keyword, "page": page})
-        request = urllib.request.Request(f"https://{host}/s?{query}", headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36", "Accept-Language": language})
-        try:
-            with urllib.request.urlopen(request, timeout=25) as response:
-                raw = response.read()
-                final_url = response.geturl()
-        except Exception as exc:
-            issue = describe_request_error(exc)
-            if collected:
+    browser = None
+    terminal_issue = ""
+    try:
+        for page in range(1, MAX_SEARCH_PAGES + 1):
+            query = urllib.parse.urlencode({"k": keyword, "page": page})
+            request = urllib.request.Request(f"https://{host}/s?{query}", headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36", "Accept-Language": language})
+            raw = None
+            issue = ""
+            from_cache = False
+            cache_date = ""
+            for attempt in range(1, AMAZON_FETCH_RETRIES + 1):
+                try:
+                    with urllib.request.urlopen(request, timeout=25) as response:
+                        candidate = response.read()
+                        final_url = response.geturl()
+                    candidate_parser = AmazonSearchParser(f"https://{host}")
+                    candidate_parser.feed(candidate.decode("utf-8", "replace"))
+                    if candidate_parser.items:
+                        raw = candidate
+                        issue = ""
+                        save_amazon_page_cache(country, keyword, page, final_url, raw)
+                        break
+                    issue = detect_page_issue(candidate)
+                except Exception as exc:
+                    issue = describe_request_error(exc)
                 if progress:
-                    progress(page, len(collected), 0, issue)
-                break
-            raise RuntimeError(issue) from exc
-        (folder / f"amazon_{country}_page_{page}.html").write_bytes(raw)
-        parser = AmazonSearchParser(f"https://{host}")
-        parser.feed(raw.decode("utf-8", "replace"))
-        if not parser.items:
-            issue = detect_page_issue(raw)
-            if collected:
+                    progress(page, len(collected), 0, f"{issue}；自动重试 {attempt}/{AMAZON_FETCH_RETRIES}")
+                if attempt < AMAZON_FETCH_RETRIES:
+                    time.sleep(min(8.0, 1.25 * (2 ** (attempt - 1))))
+
+            if raw is None and AMAZON_BROWSER_RECOVERY:
+                try:
+                    if browser is None:
+                        if progress:
+                            progress(page, len(collected), 0, "常规请求未恢复，正在打开可见 Edge 浏览器")
+                        browser = AmazonBrowserSession(AMAZON_PROFILE_DIR)
+                    browser_progress = None
+                    if progress:
+                        browser_progress = lambda current_page, _count, added, warning: progress(current_page, len(collected), added, warning)
+                    raw = browser.fetch(request.full_url, browser_progress, page)
+                    if raw:
+                        final_url = request.full_url
+                        save_amazon_page_cache(country, keyword, page, final_url, raw)
+                        issue = ""
+                except Exception as exc:
+                    issue = f"浏览器恢复失败：{exc}"
+
+            if raw is None:
+                cached = load_amazon_page_cache(country, keyword, page)
+                if cached:
+                    raw, cache_date = cached
+                    from_cache = True
+                    issue = f"实时页面未恢复，使用本机页面缓存（{cache_date[:10] or '历史'}）"
+
+            if raw is None:
+                terminal_issue = issue or "Amazon 页面未返回"
                 if progress:
-                    progress(page, len(collected), 0, issue)
+                    progress(page, len(collected), 0, terminal_issue)
                 break
-            raise RuntimeError(issue)
-        added = 0
-        for item in parser.items:
-            row = {"country": country, "category_path": category_path, "source": "Amazon public search", "source_date": datetime.now(timezone.utc).isoformat(), "asin": item["asin"], "title": item["title"], "brand": item.get("brand", ""), "price": item.get("price"), "currency": currency, "units": None, "revenue": None, "growth": None, "rating": item.get("rating"), "reviews": item.get("reviews"), "image_url": item.get("image_url", ""), "product_url": item.get("product_url", "") or f"https://{host}/dp/{item['asin']}"}
+
+            (folder / f"amazon_{country}_page_{page}.html").write_bytes(raw)
+            parser = AmazonSearchParser(f"https://{host}")
+            parser.feed(raw.decode("utf-8", "replace"))
+            if not parser.items:
+                terminal_issue = detect_page_issue(raw)
+                if progress:
+                    progress(page, len(collected), 0, terminal_issue)
+                break
+            added = 0
+            for item in parser.items:
+                row = {"country": country, "category_path": category_path, "source": "Amazon cached public search" if from_cache else "Amazon public search", "source_date": cache_date or datetime.now(timezone.utc).isoformat(), "asin": item["asin"], "title": item["title"], "brand": item.get("brand", ""), "price": item.get("price"), "currency": currency, "units": None, "revenue": None, "growth": None, "rating": item.get("rating"), "reviews": item.get("reviews"), "image_url": item.get("image_url", ""), "product_url": item.get("product_url", "") or f"https://{host}/dp/{item['asin']}"}
+                key = product_identity(row)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                row["rank"] = len(collected) + 1
+                collected.append(row)
+                added += 1
+                if len(collected) >= MAX_PRODUCTS_PER_MARKET:
+                    break
+            if progress:
+                progress(page, len(collected), added, issue if from_cache else None)
+            if len(collected) >= MAX_PRODUCTS_PER_MARKET:
+                break
+            empty_pages = empty_pages + 1 if added == 0 else 0
+            if empty_pages >= 2:
+                terminal_issue = "连续两页没有新增去重商品"
+                break
+            time.sleep(0.8)
+    finally:
+        if browser is not None:
+            browser.close()
+
+    if len(collected) < MAX_PRODUCTS_PER_MARKET:
+        snapshot, snapshot_date = load_search_snapshot(country, keyword, category_path)
+        added_from_snapshot = 0
+        for row in snapshot:
             key = product_identity(row)
             if not key or key in seen:
                 continue
+            cached_row = dict(row)
+            cached_row["source"] = "Amazon cached search snapshot"
+            cached_row["source_date"] = snapshot_date or cached_row.get("source_date", "")
+            cached_row["rank"] = len(collected) + 1
+            collected.append(cached_row)
             seen.add(key)
-            row["rank"] = len(collected) + 1
-            collected.append(row)
-            added += 1
+            added_from_snapshot += 1
             if len(collected) >= MAX_PRODUCTS_PER_MARKET:
                 break
-        if progress:
-            progress(page, len(collected), added, None)
-        if len(collected) >= MAX_PRODUCTS_PER_MARKET:
-            break
-        empty_pages = empty_pages + 1 if added == 0 else 0
-        if empty_pages >= 2:
-            break
-        time.sleep(0.6)
+        if added_from_snapshot and progress:
+            progress(0, len(collected), added_from_snapshot, f"实时采集有缺口，已从本机查询快照补回 {added_from_snapshot} 条（{snapshot_date[:10] or '历史'}）")
     items = collected[:MAX_PRODUCTS_PER_MARKET]
     if not items:
-        raise RuntimeError(f"没有取得商品。最后访问地址：{final_url}")
+        raise RuntimeError(f"没有取得商品。{terminal_issue}。最后访问地址：{final_url}")
+    save_search_snapshot(country, keyword, category_path, items)
     return items
 
 
@@ -719,10 +880,23 @@ def execute_search(run_id, keyword, category, countries):
                 outcome["warning"] = warning
             con=connect(); con.execute("UPDATE searches SET message=? WHERE id=?",(json.dumps({"countries":outcomes,"saved":saved},ensure_ascii=False),run_id)); con.commit(); con.close()
         publish_progress(0, 0, 0, None)
+        amazon_error = ""
         try:
-            items=amazon_search(code,keyword,category,publish_progress); saved+=save_products(items); outcome.update({"status":"partial" if outcome.get("warning") else "ok","count":len(items)})
+            items=amazon_search(code,keyword,category,publish_progress)
         except Exception as exc:
-            outcome.update({"status":"failed","error":str(exc)[:500]})
+            items=[]; amazon_error=str(exc)[:500]
+        if len(items)<MAX_PRODUCTS_PER_MARKET:
+            authorized=load_authorized_category_products(code,category,MAX_PRODUCTS_PER_MARKET)
+            before=len(items); items=deduplicate_products([*items,*authorized],MAX_PRODUCTS_PER_MARKET); supplemented=len(items)-before
+            if supplemented:
+                publish_progress(0,len(items),supplemented,f"Amazon 数据有缺口，已用同站点同类目的授权缓存补回 {supplemented} 条")
+        if items:
+            saved+=save_products(items); outcome.update({"status":"ok" if len(items)>=MAX_PRODUCTS_PER_MARKET else "partial","count":len(items)})
+            if len(items)<MAX_PRODUCTS_PER_MARKET:
+                detail=amazon_error or outcome.get("warning") or "可用来源商品不足"
+                outcome["warning"] = f"{detail}；最终取得 {len(items)}/{MAX_PRODUCTS_PER_MARKET} 条"
+        else:
+            outcome.update({"status":"failed","error":amazon_error or "Amazon 与同类目授权缓存均无可用商品"})
         con=connect(); con.execute("UPDATE searches SET message=? WHERE id=?",(json.dumps({"countries":outcomes,"saved":saved},ensure_ascii=False),run_id)); con.commit(); con.close()
         time.sleep(0.6)
     status="COMPLETED" if any(x["status"] in ("ok","partial") for x in outcomes) else "FAILED"

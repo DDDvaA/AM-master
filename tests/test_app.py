@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 TEMP_DATA = tempfile.TemporaryDirectory()
 os.environ["AM_MASTER_DATA_DIR"] = TEMP_DATA.name
+os.environ["AM_MASTER_AMAZON_BROWSER_RECOVERY"] = "0"
 
 import app
 import sellersprite_connector
@@ -132,7 +133,50 @@ class AnalysisTests(unittest.TestCase):
         with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), patch("app.time.sleep"):
             products = app.amazon_search("ES", "feeder", "Pet > Feeders", lambda page, count, added, warning: updates.append((page, count, warning)))
         self.assertEqual(30, len(products))
-        self.assertEqual((2, 30, "Amazon 临时拒绝或服务不可用（HTTP 503）"), updates[-1])
+        self.assertIn("HTTP 503", updates[-1][2])
+
+    def test_amazon_search_retries_503_then_recovers(self):
+        class Response:
+            def __init__(self, body, url): self.body, self.url = body, url
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+            def read(self): return self.body
+            def geturl(self): return self.url
+
+        calls = 0
+        markup = b'<div data-component-type="s-search-result" data-asin="B012345699"><h2><span>Recovered feeder</span></h2><a href="/dp/B012345699"></a></div>'
+        def fake_urlopen(request, timeout=25):
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise urllib.error.HTTPError(request.full_url, 503, "Service Unavailable", {}, None)
+            return Response(markup, request.full_url)
+
+        with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), patch("app.time.sleep"):
+            products = app.amazon_search("CA", "recovery feeder", "Pet > Recovery")
+        self.assertEqual("B012345699", products[0]["asin"])
+        self.assertGreaterEqual(calls, 3)
+
+    def test_amazon_search_uses_page_cache_after_empty_response(self):
+        class EmptyResponse:
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+            def read(self): return b""
+            def geturl(self): return "https://www.amazon.co.uk/s?k=cached"
+
+        markup = b'<div data-component-type="s-search-result" data-asin="B012345698"><h2><span>Cached feeder</span></h2><a href="/dp/B012345698"></a></div>'
+        app.save_amazon_page_cache("UK", "cached feeder", 1, "https://www.amazon.co.uk/s?k=cached", markup)
+        with patch("app.urllib.request.urlopen", return_value=EmptyResponse()), patch("app.time.sleep"):
+            products = app.amazon_search("UK", "cached feeder", "Pet > Cached")
+        self.assertEqual("B012345698", products[0]["asin"])
+        self.assertEqual("Amazon cached public search", products[0]["source"])
+
+    def test_authorized_category_cache_can_fill_amazon_gap(self):
+        base = {"country":"FR", "category_path":"Pet > Cat > Feeder", "source_date":"2026-10-23T00:00:00+00:00", "title":"Authorized feeder", "brand":"Brand", "price":79.0, "currency":"EUR", "units":300.0, "revenue":23700.0, "growth":None, "rating":4.4, "reviews":100.0, "image_url":"", "product_url":"https://www.amazon.fr/dp/B077777777", "asin":"B077777777"}
+        app.save_products([{**base, "source":"SellerSprite authorized browser"}])
+        rows = app.load_authorized_category_products("FR", "Pet > Cat > Feeder")
+        self.assertEqual(1, len(rows))
+        self.assertEqual("B077777777", rows[0]["asin"])
 
     def test_page_issue_identifies_amazon_verification(self):
         self.assertIn("风控验证页", app.detect_page_issue(b"<meta http-equiv='refresh' content='bm-verify=abc'>"))
@@ -142,7 +186,7 @@ class AnalysisTests(unittest.TestCase):
         imported = app.import_rows("research.csv", payload)
         self.assertEqual(1, imported)
         con = app.connect()
-        row = con.execute("SELECT country,asin,units,revenue FROM products").fetchone()
+        row = con.execute("SELECT country,asin,units,revenue FROM products WHERE asin='B012345678'").fetchone()
         con.close()
         self.assertEqual(("DE", "B012345678", 240.0, 19197.6), tuple(row))
         workbook = app.export_xlsx("Pet > Cat > Automatic feeder")

@@ -92,6 +92,33 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual([1, 2, 3, 4], pages)
         self.assertEqual(100, len({app.product_identity(row) for row in products}))
 
+    def test_amazon_search_keeps_partial_results_when_next_page_is_blocked(self):
+        class Response:
+            def __init__(self, body, url): self.body, self.url = body, url
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+            def read(self): return self.body
+            def geturl(self): return self.url
+
+        markup = "".join(
+            f'<div data-component-type="s-search-result" data-asin="B{number:09d}"><h2><span>Product {number}</span></h2><a href="/dp/B{number:09d}"></a></div>'
+            for number in range(1, 31)
+        ).encode()
+        updates = []
+        def fake_urlopen(request, timeout=25):
+            page = int(urllib.parse.parse_qs(urllib.parse.urlparse(request.full_url).query)["page"][0])
+            if page == 1:
+                return Response(markup, request.full_url)
+            raise urllib.error.HTTPError(request.full_url, 503, "Service Unavailable", {}, None)
+
+        with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), patch("app.time.sleep"):
+            products = app.amazon_search("ES", "feeder", "Pet > Feeders", lambda page, count, added, warning: updates.append((page, count, warning)))
+        self.assertEqual(30, len(products))
+        self.assertEqual((2, 30, "Amazon 临时拒绝或服务不可用（HTTP 503）"), updates[-1])
+
+    def test_page_issue_identifies_amazon_verification(self):
+        self.assertIn("风控验证页", app.detect_page_issue(b"<meta http-equiv='refresh' content='bm-verify=abc'>"))
+
     def test_csv_import_and_excel_export(self):
         payload = b"Country,Category,ASIN,Title,Price,Currency,Units,Revenue,Growth,Rating,Reviews\nDE,Pet > Cat > Automatic feeder,B012345678,Two hopper WiFi feeder,79.99,EUR,240,19197.6,22,4.5,120\n"
         imported = app.import_rows("research.csv", payload)

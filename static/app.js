@@ -110,6 +110,14 @@ function showNotice(message, error = false) {
   if (error) node.classList.add("error"); node.textContent = message;
 }
 
+function marketStatus(item, running = false) {
+  const label = item.label || item.country;
+  if (item.status === "ok") return `${label}: 完成 ${item.count} 条`;
+  if (item.status === "partial") return `${label}: 部分完成 ${item.count} 条（${item.warning || "后续页面未取到"}）`;
+  if (item.status === "failed") return `${label}: 0 条（${item.error || "未返回商品"}）`;
+  return `${label}: 第 ${item.page || 1} 页，已去重 ${item.count || 0}/${item.target || 100} 条${item.warning ? `（${item.warning}）` : ""}`;
+}
+
 async function searchMarkets() {
   const button = $("searchBtn");
   const keyword = $("keyword").value.trim();
@@ -121,13 +129,13 @@ async function searchMarkets() {
     do {
       task = await api(`/api/search-run?id=${encodeURIComponent(result.run_id)}`);
       const progress = task.progress?.countries || task.progress || [];
-      const statusText = progress.map((x)=>`${x.label || x.country}: ${x.status === "ok" ? `完成 ${x.count} 条` : x.status === "failed" ? "未取到" : `第 ${x.page || 1} 页，已去重 ${x.count || 0}/${x.target || 100} 条`}`).join(" | ");
-      const completeCount = progress.filter((x)=>x.status === "ok" || x.status === "failed").length;
+      const statusText = progress.map((x)=>marketStatus(x, true)).join(" | ");
+      const completeCount = progress.filter((x)=>["ok", "partial", "failed"].includes(x.status)).length;
       showNotice(`采集进度 ${completeCount}/${task.countries ? JSON.parse(task.countries).length : 7} 个站点${statusText ? `：${statusText}` : "：准备启动"}`);
       if (task.status === "RUNNING") await new Promise((resolve)=>setTimeout(resolve,800));
     } while (task.status === "RUNNING");
     const finalProgress = task.progress?.countries || [];
-    const statuses = finalProgress.map((x)=>`${x.label || x.country}: ${x.status === "ok" ? `实际取得 ${x.count} 条去重商品` : "未取到"}`).join(" | ");
+    const statuses = finalProgress.map((x)=>marketStatus(x)).join(" | ");
     showNotice(`采集结束，共缓存 ${task.progress?.saved || 0} 条。${statuses}`, task.status === "FAILED");
     activeCategory = categoryPath(); await refresh();
   } catch (err) { showNotice(err.message, true); }

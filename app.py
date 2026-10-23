@@ -162,6 +162,32 @@ def deduplicate_products(rows, limit=None):
     return unique
 
 
+def describe_request_error(exc):
+    if isinstance(exc, urllib.error.HTTPError):
+        explanations = {
+            403: "Amazon 拒绝访问（HTTP 403）",
+            429: "请求频率受限（HTTP 429）",
+            503: "Amazon 临时拒绝或服务不可用（HTTP 503）",
+        }
+        return explanations.get(exc.code, f"Amazon 请求失败（HTTP {exc.code}）")
+    if isinstance(exc, TimeoutError):
+        return "请求超时"
+    if isinstance(exc, urllib.error.URLError):
+        return f"网络连接失败：{exc.reason}"
+    return str(exc) or exc.__class__.__name__
+
+
+def detect_page_issue(raw):
+    if not raw:
+        return "Amazon 返回空页面"
+    sample = raw[:20000].lower()
+    if b"bm-verify" in sample or b"interstitialchallenge" in sample:
+        return "Amazon 返回风控验证页（bm-verify），未绕过验证"
+    if b"captcha" in sample or b"robot check" in sample:
+        return "Amazon 返回验证码页面，未绕过验证"
+    return "页面可访问，但没有识别到商品；可能是页面结构变化或非商品搜索页"
+
+
 def migrate_product_keys(con):
     rows = [dict(row) for row in con.execute("SELECT * FROM products ORDER BY source_date DESC, id DESC")]
     keepers = {}
@@ -296,12 +322,27 @@ def amazon_search(country, keyword, category_path, progress=None):
     for page in range(1, MAX_SEARCH_PAGES + 1):
         query = urllib.parse.urlencode({"k": keyword, "page": page})
         request = urllib.request.Request(f"https://{host}/s?{query}", headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36", "Accept-Language": language})
-        with urllib.request.urlopen(request, timeout=25) as response:
-            raw = response.read()
-            final_url = response.geturl()
+        try:
+            with urllib.request.urlopen(request, timeout=25) as response:
+                raw = response.read()
+                final_url = response.geturl()
+        except Exception as exc:
+            issue = describe_request_error(exc)
+            if collected:
+                if progress:
+                    progress(page, len(collected), 0, issue)
+                break
+            raise RuntimeError(issue) from exc
         (folder / f"amazon_{country}_page_{page}.html").write_bytes(raw)
         parser = AmazonSearchParser(f"https://{host}")
         parser.feed(raw.decode("utf-8", "replace"))
+        if not parser.items:
+            issue = detect_page_issue(raw)
+            if collected:
+                if progress:
+                    progress(page, len(collected), 0, issue)
+                break
+            raise RuntimeError(issue)
         added = 0
         for item in parser.items:
             row = {"country": country, "category_path": category_path, "source": "Amazon public search", "source_date": datetime.now(timezone.utc).isoformat(), "asin": item["asin"], "title": item["title"], "brand": item.get("brand", ""), "price": item.get("price"), "currency": currency, "units": None, "revenue": None, "growth": None, "rating": item.get("rating"), "reviews": item.get("reviews"), "image_url": item.get("image_url", ""), "product_url": item.get("product_url", "") or f"https://{host}/dp/{item['asin']}"}
@@ -315,16 +356,16 @@ def amazon_search(country, keyword, category_path, progress=None):
             if len(collected) >= MAX_PRODUCTS_PER_MARKET:
                 break
         if progress:
-            progress(page, len(collected), added)
+            progress(page, len(collected), added, None)
         if len(collected) >= MAX_PRODUCTS_PER_MARKET:
             break
         empty_pages = empty_pages + 1 if added == 0 else 0
-        if not parser.items or empty_pages >= 2:
+        if empty_pages >= 2:
             break
         time.sleep(0.6)
     items = collected[:MAX_PRODUCTS_PER_MARKET]
     if not items:
-        raise RuntimeError(f"页面可访问但未解析到商品。可能遇到站点拦截或页面结构变化。响应页已缓存；未尝试绕过拦截。{final_url}")
+        raise RuntimeError(f"没有取得商品。最后访问地址：{final_url}")
     return items
 
 
@@ -541,7 +582,7 @@ class Handler(BaseHTTPRequestHandler):
             if STATIC not in file.parents: return self.send_error(404)
             if not file.is_file(): return self.send_error(404)
             body=file.read_bytes(); kind="text/html; charset=utf-8" if file.suffix==".html" else "text/css; charset=utf-8" if file.suffix==".css" else "text/csv; charset=utf-8" if file.suffix==".csv" else "application/javascript; charset=utf-8"
-            self.send_response(200); self.send_header("Content-Type",kind); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body); return
+            self.send_response(200); self.send_header("Content-Type",kind); self.send_header("Content-Length",str(len(body))); self.send_header("Cache-Control","no-store"); self.end_headers(); self.wfile.write(body); return
         return self.send_error(404)
 
     def do_POST(self):
@@ -587,17 +628,19 @@ def execute_search(run_id, keyword, category, countries):
     for code in countries:
         outcome={"country":code,"label":COUNTRIES[code][0],"status":"RUNNING","page":0,"count":0,"target":MAX_PRODUCTS_PER_MARKET}
         outcomes.append(outcome)
-        def publish_progress(page, count, added):
+        def publish_progress(page, count, added, warning=None):
             outcome.update({"page":page,"count":count,"added":added})
+            if warning:
+                outcome["warning"] = warning
             con=connect(); con.execute("UPDATE searches SET message=? WHERE id=?",(json.dumps({"countries":outcomes,"saved":saved},ensure_ascii=False),run_id)); con.commit(); con.close()
-        publish_progress(0, 0, 0)
+        publish_progress(0, 0, 0, None)
         try:
-            items=amazon_search(code,keyword,category,publish_progress); saved+=save_products(items); outcome.update({"status":"ok","count":len(items)})
+            items=amazon_search(code,keyword,category,publish_progress); saved+=save_products(items); outcome.update({"status":"partial" if outcome.get("warning") else "ok","count":len(items)})
         except Exception as exc:
             outcome.update({"status":"failed","error":str(exc)[:500]})
         con=connect(); con.execute("UPDATE searches SET message=? WHERE id=?",(json.dumps({"countries":outcomes,"saved":saved},ensure_ascii=False),run_id)); con.commit(); con.close()
         time.sleep(0.6)
-    status="COMPLETED" if any(x["status"]=="ok" for x in outcomes) else "FAILED"
+    status="COMPLETED" if any(x["status"] in ("ok","partial") for x in outcomes) else "FAILED"
     con=connect(); con.execute("UPDATE searches SET status=?,finished_at=?,message=? WHERE id=?",(status,datetime.now(timezone.utc).isoformat(),json.dumps({"countries":outcomes,"saved":saved},ensure_ascii=False),run_id)); con.commit(); con.close()
 
 

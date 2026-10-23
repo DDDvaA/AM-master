@@ -30,6 +30,10 @@ DATA_DIR = Path(os.environ.get("AM_MASTER_DATA_DIR", str(DEFAULT_DATA))).expandu
 DB_PATH = DATA_DIR / "am_master.sqlite3"
 RAW_DIR = DATA_DIR / "raw"
 PORT = int(os.environ.get("AM_MASTER_PORT", "8777"))
+MAX_PRODUCTS_PER_MARKET = 100
+MAX_SEARCH_PAGES = 10
+_DB_INIT_LOCK = threading.Lock()
+_INITIALIZED_DATABASES = set()
 COUNTRIES = {
     "US": ("美国", "www.amazon.com", "USD", "en-US,en;q=0.9"),
     "CA": ("加拿大", "www.amazon.ca", "CAD", "en-CA,en;q=0.9"),
@@ -62,26 +66,38 @@ def connect():
     con = sqlite3.connect(DB_PATH, timeout=30)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
-    con.executescript("""
-      CREATE TABLE IF NOT EXISTS products(
-        id INTEGER PRIMARY KEY, country TEXT NOT NULL, category_path TEXT NOT NULL DEFAULT '',
-        source TEXT NOT NULL, source_date TEXT NOT NULL, asin TEXT NOT NULL DEFAULT '',
-        title TEXT NOT NULL, brand TEXT NOT NULL DEFAULT '', price REAL, currency TEXT,
-        units REAL, revenue REAL, growth REAL, rating REAL, reviews REAL,
-        image_url TEXT, product_url TEXT, raw_json TEXT NOT NULL DEFAULT '{}',
-        UNIQUE(country, source, source_date, asin, title)
-      );
-      CREATE INDEX IF NOT EXISTS ix_products_scope ON products(country,category_path,source_date);
-      CREATE TABLE IF NOT EXISTS searches(
-        id TEXT PRIMARY KEY, keyword TEXT NOT NULL, category_path TEXT NOT NULL,
-        countries TEXT NOT NULL, status TEXT NOT NULL, started_at TEXT NOT NULL,
-        finished_at TEXT, message TEXT NOT NULL DEFAULT ''
-      );
-      CREATE TABLE IF NOT EXISTS analyses(
-        id TEXT PRIMARY KEY, product_name TEXT NOT NULL, category_path TEXT NOT NULL,
-        product_text TEXT NOT NULL, created_at TEXT NOT NULL, result_json TEXT NOT NULL
-      );
-    """)
+    database_id = str(DB_PATH.resolve())
+    if database_id not in _INITIALIZED_DATABASES:
+        with _DB_INIT_LOCK:
+            if database_id not in _INITIALIZED_DATABASES:
+                con.executescript("""
+                  CREATE TABLE IF NOT EXISTS products(
+                    id INTEGER PRIMARY KEY, country TEXT NOT NULL, category_path TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL, source_date TEXT NOT NULL, asin TEXT NOT NULL DEFAULT '',
+                    title TEXT NOT NULL, brand TEXT NOT NULL DEFAULT '', price REAL, currency TEXT,
+                    units REAL, revenue REAL, growth REAL, rating REAL, reviews REAL,
+                    image_url TEXT, product_url TEXT, product_key TEXT NOT NULL DEFAULT '',
+                    raw_json TEXT NOT NULL DEFAULT '{}',
+                    UNIQUE(country, source, source_date, asin, title)
+                  );
+                  CREATE INDEX IF NOT EXISTS ix_products_scope ON products(country,category_path,source_date);
+                  CREATE TABLE IF NOT EXISTS searches(
+                    id TEXT PRIMARY KEY, keyword TEXT NOT NULL, category_path TEXT NOT NULL,
+                    countries TEXT NOT NULL, status TEXT NOT NULL, started_at TEXT NOT NULL,
+                    finished_at TEXT, message TEXT NOT NULL DEFAULT ''
+                  );
+                  CREATE TABLE IF NOT EXISTS analyses(
+                    id TEXT PRIMARY KEY, product_name TEXT NOT NULL, category_path TEXT NOT NULL,
+                    product_text TEXT NOT NULL, created_at TEXT NOT NULL, result_json TEXT NOT NULL
+                  );
+                """)
+                columns = {row[1] for row in con.execute("PRAGMA table_info(products)")}
+                if "product_key" not in columns:
+                    con.execute("ALTER TABLE products ADD COLUMN product_key TEXT NOT NULL DEFAULT ''")
+                migrate_product_keys(con)
+                con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_products_country_key ON products(country,product_key) WHERE product_key<>''")
+                con.commit()
+                _INITIALIZED_DATABASES.add(database_id)
     return con
 
 
@@ -105,6 +121,73 @@ def clean_number(value):
         return float(text)
     except ValueError:
         return None
+
+
+def normalized_product_url(value):
+    try:
+        parsed = urllib.parse.urlparse(str(value or "").strip())
+    except ValueError:
+        return ""
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return ""
+    path = re.sub(r"/(ref|gp/aw/d)/.*$", "", parsed.path.rstrip("/"), flags=re.I)
+    return f"{parsed.netloc.lower()}{path.lower()}"
+
+
+def product_identity(row):
+    asin = re.sub(r"[^A-Z0-9]", "", str(row.get("asin") or "").upper())
+    if asin:
+        return f"asin:{asin}"
+    match = re.search(r"/(?:dp|gp/product)/([A-Z0-9]{10})(?:[/?]|$)", str(row.get("product_url") or ""), re.I)
+    if match:
+        return f"asin:{match.group(1).upper()}"
+    url = normalized_product_url(row.get("product_url"))
+    if url:
+        return f"url:{url}"
+    title = re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", str(row.get("title") or "").lower())
+    return f"title:{title}" if title else ""
+
+
+def deduplicate_products(rows, limit=None):
+    unique = []
+    seen = set()
+    for row in rows:
+        key = product_identity(row)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(row)
+        if limit and len(unique) >= limit:
+            break
+    return unique
+
+
+def migrate_product_keys(con):
+    rows = [dict(row) for row in con.execute("SELECT * FROM products ORDER BY source_date DESC, id DESC")]
+    keepers = {}
+    for row in rows:
+        key = product_identity(row)
+        if not key:
+            continue
+        keeper = keepers.get((row["country"], key))
+        if keeper is None:
+            keepers[(row["country"], key)] = row
+            con.execute("UPDATE products SET product_key=? WHERE id=?", (key, row["id"]))
+            continue
+        updates = {}
+        keeper_has_metrics = any(keeper.get(field) is not None for field in ("units", "revenue", "growth"))
+        row_has_metrics = any(row.get(field) is not None for field in ("units", "revenue", "growth"))
+        if row_has_metrics and not keeper_has_metrics:
+            updates["source"] = row["source"]
+            keeper["source"] = row["source"]
+        for field in ("units", "revenue", "growth", "price", "rating", "reviews", "image_url", "product_url"):
+            if keeper.get(field) in (None, "") and row.get(field) not in (None, ""):
+                updates[field] = row[field]
+                keeper[field] = row[field]
+        if updates:
+            assignment = ",".join(f"{field}=?" for field in updates)
+            con.execute(f"UPDATE products SET {assignment} WHERE id=?", (*updates.values(), keeper["id"]))
+        con.execute("DELETE FROM products WHERE id=?", (row["id"],))
 
 
 def normalize_header(value):
@@ -146,6 +229,7 @@ class AmazonSearchParser(HTMLParser):
         self.depth = 0
         self.capture = None
         self.capture_depth = 0
+        self.title_depth = None
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
@@ -154,15 +238,19 @@ class AmazonSearchParser(HTMLParser):
             self.root_depth = self.depth
         if self.item is not None:
             cls = attrs.get("class", "")
+            if tag == "h2":
+                self.title_depth = self.depth
             if tag == "img" and not self.item["image_url"]:
                 self.item["image_url"] = attrs.get("src", "") or attrs.get("data-src", "")
             if tag == "a" and ("s-link-style" in cls or re.search(r"/dp/[A-Z0-9]{10}", attrs.get("href", ""))) and not self.item["product_url"]:
                 self.item["product_url"] = urllib.parse.urljoin(self.base_url, attrs.get("href", ""))
+                if attrs.get("aria-label") and not self.item["title"]:
+                    self.item["title"] = attrs["aria-label"].strip()
             if tag == "span":
                 if "a-price-whole" in cls: self.capture = "price"
                 elif "a-icon-alt" in cls: self.capture = "rating"
                 elif "s-underline-text" in cls: self.capture = "reviews"
-                elif "a-size-base-plus" in cls and not self.item["title"]: self.capture = "title"
+                elif (self.title_depth is not None or "a-size-base-plus" in cls or "a-size-medium" in cls) and not self.item["title"]: self.capture = "title"
                 elif "a-size-base" in cls and not self.item["brand"]: self.capture = "brand"
                 if self.capture: self.capture_depth = self.depth
         if tag not in {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}:
@@ -175,8 +263,11 @@ class AmazonSearchParser(HTMLParser):
                 self.items.append(self.item)
             self.item = None
             self.capture = None
+            self.title_depth = None
         elif self.capture and self.depth <= self.capture_depth:
             self.capture = None
+        if self.title_depth is not None and self.depth <= self.title_depth:
+            self.title_depth = None
 
     def handle_data(self, data):
         if self.item is None or not self.capture:
@@ -192,38 +283,75 @@ class AmazonSearchParser(HTMLParser):
             self.item[key] = (self.item.get(key, "") + " " + value).strip()
 
 
-def amazon_search(country, keyword, category_path):
+def amazon_search(country, keyword, category_path, progress=None):
     label, host, currency, language = COUNTRIES[country]
-    query = urllib.parse.urlencode({"k": keyword})
-    url = f"https://{host}/s?{query}"
-    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36", "Accept-Language": language})
-    with urllib.request.urlopen(request, timeout=25) as response:
-        raw = response.read()
-        final_url = response.geturl()
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     folder = RAW_DIR / stamp
     folder.mkdir(parents=True, exist_ok=True)
-    (folder / f"amazon_{country}.html").write_bytes(raw)
-    parser = AmazonSearchParser(f"https://{host}")
-    parser.feed(raw.decode("utf-8", "replace"))
-    items = []
-    for rank, item in enumerate(parser.items[:50], 1):
-        items.append({"country": country, "category_path": category_path, "source": "Amazon public search", "source_date": datetime.now(timezone.utc).isoformat(), "asin": item["asin"], "title": item["title"], "brand": item.get("brand", ""), "price": item.get("price"), "currency": currency, "units": None, "revenue": None, "growth": None, "rating": item.get("rating"), "reviews": item.get("reviews"), "image_url": item.get("image_url", ""), "product_url": item.get("product_url", "") or f"https://{host}/dp/{item['asin']}", "rank": rank})
+    collected = []
+    seen = set()
+    final_url = ""
+    empty_pages = 0
+    for page in range(1, MAX_SEARCH_PAGES + 1):
+        query = urllib.parse.urlencode({"k": keyword, "page": page})
+        request = urllib.request.Request(f"https://{host}/s?{query}", headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36", "Accept-Language": language})
+        with urllib.request.urlopen(request, timeout=25) as response:
+            raw = response.read()
+            final_url = response.geturl()
+        (folder / f"amazon_{country}_page_{page}.html").write_bytes(raw)
+        parser = AmazonSearchParser(f"https://{host}")
+        parser.feed(raw.decode("utf-8", "replace"))
+        added = 0
+        for item in parser.items:
+            row = {"country": country, "category_path": category_path, "source": "Amazon public search", "source_date": datetime.now(timezone.utc).isoformat(), "asin": item["asin"], "title": item["title"], "brand": item.get("brand", ""), "price": item.get("price"), "currency": currency, "units": None, "revenue": None, "growth": None, "rating": item.get("rating"), "reviews": item.get("reviews"), "image_url": item.get("image_url", ""), "product_url": item.get("product_url", "") or f"https://{host}/dp/{item['asin']}"}
+            key = product_identity(row)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            row["rank"] = len(collected) + 1
+            collected.append(row)
+            added += 1
+            if len(collected) >= MAX_PRODUCTS_PER_MARKET:
+                break
+        if progress:
+            progress(page, len(collected), added)
+        if len(collected) >= MAX_PRODUCTS_PER_MARKET:
+            break
+        empty_pages = empty_pages + 1 if added == 0 else 0
+        if not parser.items or empty_pages >= 2:
+            break
+        time.sleep(0.6)
+    items = collected[:MAX_PRODUCTS_PER_MARKET]
     if not items:
         raise RuntimeError(f"页面可访问但未解析到商品。可能遇到站点拦截或页面结构变化。响应页已缓存；未尝试绕过拦截。{final_url}")
     return items
 
 
 def save_products(items):
+    items = deduplicate_products(items)
     if not items:
         return 0
     con = connect()
     for row in items:
-        con.execute("""INSERT INTO products(country,category_path,source,source_date,asin,title,brand,price,currency,units,revenue,growth,rating,reviews,image_url,product_url,raw_json)
-          VALUES(:country,:category_path,:source,:source_date,:asin,:title,:brand,:price,:currency,:units,:revenue,:growth,:rating,:reviews,:image_url,:product_url,:raw_json)
-          ON CONFLICT(country,source,source_date,asin,title) DO UPDATE SET price=excluded.price,rating=excluded.rating,reviews=excluded.reviews,image_url=excluded.image_url,product_url=excluded.product_url""",
-          {**row, "raw_json": json.dumps(row, ensure_ascii=False)})
+        row = {**row, "product_key": product_identity(row), "raw_json": json.dumps(row, ensure_ascii=False)}
+        con.execute("""INSERT INTO products(country,category_path,source,source_date,asin,title,brand,price,currency,units,revenue,growth,rating,reviews,image_url,product_url,product_key,raw_json)
+          VALUES(:country,:category_path,:source,:source_date,:asin,:title,:brand,:price,:currency,:units,:revenue,:growth,:rating,:reviews,:image_url,:product_url,:product_key,:raw_json)
+          ON CONFLICT(country,product_key) WHERE product_key<>'' DO UPDATE SET
+            category_path=excluded.category_path,
+            source=CASE
+              WHEN excluded.units IS NOT NULL OR excluded.revenue IS NOT NULL OR excluded.growth IS NOT NULL THEN excluded.source
+              WHEN products.units IS NOT NULL OR products.revenue IS NOT NULL OR products.growth IS NOT NULL THEN products.source
+              ELSE excluded.source END,
+            source_date=excluded.source_date,
+            asin=CASE WHEN excluded.asin<>'' THEN excluded.asin ELSE products.asin END,
+            title=excluded.title, brand=CASE WHEN excluded.brand<>'' THEN excluded.brand ELSE products.brand END,
+            price=COALESCE(excluded.price,products.price), currency=COALESCE(excluded.currency,products.currency),
+            units=COALESCE(excluded.units,products.units), revenue=COALESCE(excluded.revenue,products.revenue), growth=COALESCE(excluded.growth,products.growth),
+            rating=COALESCE(excluded.rating,products.rating), reviews=COALESCE(excluded.reviews,products.reviews),
+            image_url=CASE WHEN excluded.image_url<>'' THEN excluded.image_url ELSE products.image_url END,
+            product_url=CASE WHEN excluded.product_url<>'' THEN excluded.product_url ELSE products.product_url END,
+            raw_json=excluded.raw_json""", row)
     con.commit(); con.close()
     return len(items)
 
@@ -457,11 +585,14 @@ class ExportHandler(Handler):
 def execute_search(run_id, keyword, category, countries):
     outcomes=[]; saved=0
     for code in countries:
-        outcome={"country":code,"label":COUNTRIES[code][0],"status":"RUNNING"}
+        outcome={"country":code,"label":COUNTRIES[code][0],"status":"RUNNING","page":0,"count":0,"target":MAX_PRODUCTS_PER_MARKET}
         outcomes.append(outcome)
-        con=connect(); con.execute("UPDATE searches SET message=? WHERE id=?",(json.dumps(outcomes,ensure_ascii=False),run_id)); con.commit(); con.close()
+        def publish_progress(page, count, added):
+            outcome.update({"page":page,"count":count,"added":added})
+            con=connect(); con.execute("UPDATE searches SET message=? WHERE id=?",(json.dumps({"countries":outcomes,"saved":saved},ensure_ascii=False),run_id)); con.commit(); con.close()
+        publish_progress(0, 0, 0)
         try:
-            items=amazon_search(code,keyword,category); saved+=save_products(items); outcome.update({"status":"ok","count":len(items)})
+            items=amazon_search(code,keyword,category,publish_progress); saved+=save_products(items); outcome.update({"status":"ok","count":len(items)})
         except Exception as exc:
             outcome.update({"status":"failed","error":str(exc)[:500]})
         con=connect(); con.execute("UPDATE searches SET message=? WHERE id=?",(json.dumps({"countries":outcomes,"saved":saved},ensure_ascii=False),run_id)); con.commit(); con.close()

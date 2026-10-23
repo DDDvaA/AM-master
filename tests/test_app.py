@@ -6,6 +6,7 @@ import threading
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
+from unittest.mock import patch
 
 TEMP_DATA = tempfile.TemporaryDirectory()
 os.environ["AM_MASTER_DATA_DIR"] = TEMP_DATA.name
@@ -45,6 +46,46 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual("Sample feeder", parser.items[0]["title"])
         self.assertEqual("https://www.amazon.ca/dp/B012345678", parser.items[0]["product_url"])
 
+    def test_public_search_parser_accepts_modern_h2_title(self):
+        markup = '''<div data-component-type="s-search-result" data-asin="B012345679"><h2><span>Modern title markup</span></h2><a href="/dp/B012345679"><img src="https://img.example/new.jpg"></a></div>'''
+        parser = app.AmazonSearchParser("https://www.amazon.com")
+        parser.feed(markup)
+        self.assertEqual("Modern title markup", parser.items[0]["title"])
+
+    def test_product_deduplication_prefers_asin_then_url(self):
+        rows = [
+            {"asin":"B012345678", "title":"First", "product_url":"https://www.amazon.com/dp/B012345678?ref=x"},
+            {"asin":"B012345678", "title":"Changed title", "product_url":"https://www.amazon.com/dp/B012345678"},
+            {"asin":"", "title":"URL product", "product_url":"https://www.amazon.com/dp/B087654321?tag=test"},
+            {"asin":"", "title":"Same URL product", "product_url":"https://www.amazon.com/dp/B087654321/ref=something"},
+        ]
+        self.assertEqual(2, len(app.deduplicate_products(rows)))
+
+    def test_amazon_search_collects_up_to_100_unique_products(self):
+        class Response:
+            def __init__(self, body, url): self.body, self.url = body, url
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+            def read(self): return self.body
+            def geturl(self): return self.url
+
+        pages = []
+        def fake_urlopen(request, timeout=25):
+            page = int(urllib.parse.parse_qs(urllib.parse.urlparse(request.full_url).query)["page"][0])
+            pages.append(page)
+            start = (page - 1) * 30 + 1
+            markup = "".join(
+                f'<div data-component-type="s-search-result" data-asin="B{number:09d}"><h2><span>Product {number}</span></h2><a href="/dp/B{number:09d}"><img src="https://img.example/{number}.jpg"></a></div>'
+                for number in range(start, start + 30)
+            )
+            return Response(markup.encode(), request.full_url)
+
+        with patch("app.urllib.request.urlopen", side_effect=fake_urlopen), patch("app.time.sleep"):
+            products = app.amazon_search("US", "feeder", "Pet > Feeders")
+        self.assertEqual(100, len(products))
+        self.assertEqual([1, 2, 3, 4], pages)
+        self.assertEqual(100, len({app.product_identity(row) for row in products}))
+
     def test_csv_import_and_excel_export(self):
         payload = b"Country,Category,ASIN,Title,Price,Currency,Units,Revenue,Growth,Rating,Reviews\nDE,Pet > Cat > Automatic feeder,B012345678,Two hopper WiFi feeder,79.99,EUR,240,19197.6,22,4.5,120\n"
         imported = app.import_rows("research.csv", payload)
@@ -55,6 +96,16 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(("DE", "B012345678", 240.0, 19197.6), tuple(row))
         workbook = app.export_xlsx("Pet > Cat > Automatic feeder")
         self.assertGreater(len(workbook), 1000)
+
+    def test_save_products_deduplicates_and_preserves_sales_metrics(self):
+        base = {"country":"US", "category_path":"Pet > Feeders", "source_date":"2026-10-23T00:00:00+00:00", "asin":"B099999999", "title":"Imported feeder", "brand":"Brand", "price":89.0, "currency":"USD", "units":200.0, "revenue":17800.0, "growth":21.0, "rating":4.3, "reviews":80.0, "image_url":"", "product_url":"https://www.amazon.com/dp/B099999999"}
+        app.save_products([{**base, "source":"导入:research.csv"}])
+        app.save_products([{**base, "source":"Amazon public search", "source_date":"2026-10-24T00:00:00+00:00", "title":"Updated public title", "units":None, "revenue":None, "growth":None, "rating":4.4}])
+        con = app.connect()
+        rows = con.execute("SELECT source,title,units,revenue,growth,rating FROM products WHERE country='US' AND asin='B099999999'").fetchall()
+        con.close()
+        self.assertEqual(1, len(rows))
+        self.assertEqual(("导入:research.csv", "Updated public title", 200.0, 17800.0, 21.0, 4.4), tuple(rows[0]))
 
 
 class HttpValidationTests(unittest.TestCase):

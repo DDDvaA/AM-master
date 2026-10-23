@@ -121,13 +121,13 @@ async function searchMarkets() {
     do {
       task = await api(`/api/search-run?id=${encodeURIComponent(result.run_id)}`);
       const progress = task.progress?.countries || task.progress || [];
-      const statusText = progress.map((x)=>`${x.label || x.country}: ${x.status === "ok" ? `完成 ${x.count} 条` : x.status === "failed" ? "未取到" : "正在读取"}`).join(" | ");
+      const statusText = progress.map((x)=>`${x.label || x.country}: ${x.status === "ok" ? `完成 ${x.count} 条` : x.status === "failed" ? "未取到" : `第 ${x.page || 1} 页，已去重 ${x.count || 0}/${x.target || 100} 条`}`).join(" | ");
       const completeCount = progress.filter((x)=>x.status === "ok" || x.status === "failed").length;
       showNotice(`采集进度 ${completeCount}/${task.countries ? JSON.parse(task.countries).length : 7} 个站点${statusText ? `：${statusText}` : "：准备启动"}`);
       if (task.status === "RUNNING") await new Promise((resolve)=>setTimeout(resolve,800));
     } while (task.status === "RUNNING");
     const finalProgress = task.progress?.countries || [];
-    const statuses = finalProgress.map((x)=>`${x.label || x.country}: ${x.status === "ok" ? x.count + " 条" : "未取到"}`).join(" | ");
+    const statuses = finalProgress.map((x)=>`${x.label || x.country}: ${x.status === "ok" ? `实际取得 ${x.count} 条去重商品` : "未取到"}`).join(" | ");
     showNotice(`采集结束，共缓存 ${task.progress?.saved || 0} 条。${statuses}`, task.status === "FAILED");
     activeCategory = categoryPath(); await refresh();
   } catch (err) { showNotice(err.message, true); }

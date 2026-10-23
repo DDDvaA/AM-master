@@ -240,12 +240,12 @@ class AmazonSearchParser(HTMLParser):
             cls = attrs.get("class", "")
             if tag == "h2":
                 self.title_depth = self.depth
+                if attrs.get("aria-label"):
+                    self.item["title"] = attrs["aria-label"].strip()
             if tag == "img" and not self.item["image_url"]:
                 self.item["image_url"] = attrs.get("src", "") or attrs.get("data-src", "")
             if tag == "a" and ("s-link-style" in cls or re.search(r"/dp/[A-Z0-9]{10}", attrs.get("href", ""))) and not self.item["product_url"]:
                 self.item["product_url"] = urllib.parse.urljoin(self.base_url, attrs.get("href", ""))
-                if attrs.get("aria-label") and not self.item["title"]:
-                    self.item["title"] = attrs["aria-label"].strip()
             if tag == "span":
                 if "a-price-whole" in cls: self.capture = "price"
                 elif "a-icon-alt" in cls: self.capture = "rating"

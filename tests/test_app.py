@@ -52,6 +52,12 @@ class AnalysisTests(unittest.TestCase):
         parser.feed(markup)
         self.assertEqual("Modern title markup", parser.items[0]["title"])
 
+    def test_product_badge_does_not_replace_h2_title(self):
+        markup = '''<div data-component-type="s-search-result" data-asin="B012345670"><a aria-label="Amazon's Choice: Overall Pick" href="/dp/B012345670">Badge</a><a class="s-link-style" href="/dp/B012345670"><h2 aria-label="Real feeder title"><span>Real feeder title</span></h2></a></div>'''
+        parser = app.AmazonSearchParser("https://www.amazon.com")
+        parser.feed(markup)
+        self.assertEqual("Real feeder title", parser.items[0]["title"])
+
     def test_product_deduplication_prefers_asin_then_url(self):
         rows = [
             {"asin":"B012345678", "title":"First", "product_url":"https://www.amazon.com/dp/B012345678?ref=x"},

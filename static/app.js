@@ -6,6 +6,7 @@ const $ = (id) => document.getElementById(id);
 let activeCountry = "";
 let activeCategory = "";
 let latestProducts = [];
+let latestReviewCountries = [];
 
 function countryControls(target, checked = true) {
   $(target).innerHTML = COUNTRIES.map(([code]) => `<label class="country-pill"><input type="checkbox" value="${code}" ${checked ? "checked" : ""}><span>${code}</span></label>`).join("");
@@ -64,14 +65,14 @@ function productCell(row) {
 
 function renderRows(items, target, mode = "research") {
   if (!items.length) {
-    $(target).innerHTML = `<tr><td colspan="${mode === "data" ? 8 : 9}" class="empty-cell">暂无符合条件的记录。公开商品页不含可验证的销量和销售额。</td></tr>`;
+    $(target).innerHTML = `<tr><td colspan="${mode === "data" ? 9 : 10}" class="empty-cell">暂无符合条件的记录。公开商品页不含可验证的销量和销售额。</td></tr>`;
     return;
   }
   if (mode === "data") {
-    $(target).innerHTML = items.map((r) => `<tr><td>${productCell(r)}</td><td>${esc(r.country)}</td><td>${esc(r.category_path || "--")}</td><td>${formatPrice(r)}</td><td>${r.units ?? "--"}</td><td>${r.revenue ?? "--"}</td><td>${r.rating ?? "--"}</td><td>${esc(r.source)}</td></tr>`).join("");
+    $(target).innerHTML = items.map((r) => `<tr><td>${productCell(r)}</td><td>${esc(r.country)}</td><td>${esc(r.category_path || "--")}</td><td>${r.bsr_rank ?? "--"}</td><td>${formatPrice(r)}</td><td>${r.units ?? "--"}</td><td>${r.revenue ?? "--"}</td><td>${r.rating ?? "--"}</td><td>${esc(r.source)}</td></tr>`).join("");
     return;
   }
-  $(target).innerHTML = items.map((r) => `<tr><td>${productCell(r)}</td><td>${esc(r.country)}</td><td>${formatPrice(r)}</td><td>${r.units ?? "--"}</td><td>${r.revenue ?? "--"}</td><td>${r.growth == null ? "--" : `${r.growth}%`}</td><td>${r.rating == null ? "--" : `${r.rating} / ${r.reviews ?? "--"}`}</td><td>${tagsMarkup(r.opportunity_tags)}</td><td>${esc(r.source)}</td></tr>`).join("");
+  $(target).innerHTML = items.map((r) => `<tr><td>${productCell(r)}</td><td>${esc(r.country)}</td><td>${r.bsr_rank ?? "--"}</td><td>${formatPrice(r)}</td><td>${r.units ?? "--"}</td><td>${r.revenue ?? "--"}</td><td>${r.growth == null ? "--" : `${r.growth}%`}</td><td>${r.rating == null ? "--" : `${r.rating} / ${r.reviews ?? "--"}`}</td><td>${tagsMarkup(r.opportunity_tags)}</td><td>${esc(r.source)}</td></tr>`).join("");
 }
 
 function filterProducts() {
@@ -103,6 +104,47 @@ async function refresh() {
   countryFilter.value = selected;
   filterProducts();
   renderRows(latestProducts, "dataRows", "data");
+}
+
+function renderReviews() {
+  const countryFilter = $("reviewCountryFilter").value;
+  const countries = latestReviewCountries.filter((item)=>!countryFilter || item.country === countryFilter);
+  $("reviewSummary").innerHTML = countries.map((item)=>{
+    const themes = item.themes.slice(0,5).map((theme)=>`<span class="review-theme">${esc(theme.theme)} <b>${theme.count}</b><small>低星 ${theme.negative}</small></span>`).join("") || '<span class="tag gray">暂无主题样本</span>';
+    return `<article class="review-country-card"><div class="review-country-head"><div><small>${esc(item.country)}</small><h3>${esc(item.label)}</h3></div><strong>${item.sample_count}</strong></div><dl><div><dt>商品数</dt><dd>${item.product_count}</dd></div><div><dt>平均星级</dt><dd>${item.average_rating ?? "--"}</dd></div><div><dt>低星评论</dt><dd>${item.negative_count}</dd></div><div><dt>最近采集</dt><dd>${item.latest_collection ? new Date(item.latest_collection).toLocaleString() : "--"}</dd></div></dl><div class="review-themes">${themes}</div></article>`;
+  }).join("");
+  const rows = countries.flatMap((item)=>item.reviews.map((review)=>({...review,country_label:item.label})));
+  $("reviewRows").innerHTML = rows.length ? rows.map((r)=>{
+    let themes=[]; try { themes=JSON.parse(r.themes_json || "[]"); } catch {}
+    return `<tr><td><b>${esc(r.country_label)}</b><small class="table-sub">${esc(r.asin)} · ${esc(r.product_title)}</small></td><td>${r.rating ?? "--"}</td><td><b>${esc(r.review_title || "无标题")}</b><div class="review-body">${esc(r.review_body)}</div></td><td>${esc(r.review_date_text || "--")}</td><td>${r.verified ? "已验证购买" : "未标注"}<small class="table-sub">有用 ${r.helpful_count || 0}</small></td><td>${themes.map((x)=>`<span class="tag">${esc(x)}</span>`).join(" ") || "--"}</td><td><a href="${esc(safeUrl(r.review_url))}" target="_blank" rel="noopener">Amazon 原评论</a><small class="table-sub">${new Date(r.collected_at).toLocaleString()}</small></td></tr>`;
+  }).join("") : '<tr><td colspan="7" class="empty-cell">尚未采集到评论原文。</td></tr>';
+}
+
+async function refreshReviews() {
+  const category = $("reviewCategory").value.trim();
+  const payload = await api(`/api/reviews${category ? `?category=${encodeURIComponent(category)}` : ""}`);
+  latestReviewCountries = payload.items || [];
+  const filter = $("reviewCountryFilter"); const selected = filter.value;
+  filter.innerHTML = '<option value="">所有国家</option>' + COUNTRIES.map(([code,label])=>`<option value="${code}">${label}</option>`).join(""); filter.value=selected;
+  renderReviews();
+}
+
+function reviewProgressText(run) {
+  const countries = run.result?.countries || [];
+  const details = countries.map((item)=>`${item.label}: ${item.reviews || 0} 条${item.status === "failed" ? `（${item.error || item.warning || "失败"}）` : ""}`).join(" | ");
+  return `${run.message}${details ? ` · ${details}` : ""}`;
+}
+
+async function syncReviews() {
+  const button=$("reviewSyncBtn"); button.disabled=true;
+  const notice=$("reviewNotice"); notice.classList.remove("hidden","error"); notice.textContent="正在选择 BSR 优先商品并启动评论采集…";
+  try {
+    const run=await api("/api/reviews/sync",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({countries:selectedCountries("reviewCountryChecks"),category_path:$("reviewCategory").value.trim(),products_per_country:Number($("reviewProductLimit").value),reviews_per_product:Number($("reviewLimit").value)})});
+    let state;
+    do { state=await api(`/api/sellersprite-run?id=${encodeURIComponent(run.id)}`); notice.textContent=reviewProgressText(state); notice.classList.toggle("error",state.status==="FAILED"); if(state.status==="RUNNING") await new Promise((resolve)=>setTimeout(resolve,1000)); } while(state.status==="RUNNING");
+    await refreshReviews(); await refresh();
+  } catch(err) { notice.classList.add("error"); notice.textContent=err.message; }
+  finally { button.disabled=false; }
 }
 
 function showNotice(message, error = false) {
@@ -219,13 +261,14 @@ document.querySelectorAll(".nav-item").forEach((button)=>button.addEventListener
   document.querySelectorAll(".nav-item").forEach((x)=>x.classList.toggle("active",x===button));
   document.querySelectorAll(".view").forEach((x)=>x.classList.toggle("active",x.id===`view-${button.dataset.view}`));
 }));
-countryControls("countryChecks"); countryControls("analysisCountryChecks");
+countryControls("countryChecks"); countryControls("analysisCountryChecks"); countryControls("reviewCountryChecks");
 $("searchBtn").addEventListener("click",searchMarkets); $("keyword").addEventListener("keydown",(e)=>{if(e.key==="Enter")searchMarkets();});
 $("analyzeBtn").addEventListener("click",analyze); $("countryFilter").addEventListener("change",filterProducts); $("tagFilter").addEventListener("change",filterProducts);
 $("refreshBtn").addEventListener("click",()=>refresh().catch((e)=>showNotice(e.message,true)));
 for (const id of ["exportBtn","exportBtn2"]) $(id).addEventListener("click",()=>{window.location.href=`/api/export.xlsx${activeCategory?`?category=${encodeURIComponent(activeCategory)}`:""}`;});
 $("fileInput").addEventListener("change",(e)=>importFile(e.target.files[0]));
 $("sellerLoginBtn").addEventListener("click",sellerLogin); $("sellerSyncBtn").addEventListener("click",sellerSync);
+$("reviewSyncBtn").addEventListener("click",syncReviews); $("refreshReviewsBtn").addEventListener("click",()=>refreshReviews().catch((e)=>{$("reviewNotice").textContent=e.message;})); $("reviewCountryFilter").addEventListener("change",renderReviews);
 $("dropZone").addEventListener("dragover",(e)=>{e.preventDefault();});
 $("dropZone").addEventListener("drop",(e)=>{e.preventDefault();importFile(e.dataTransfer.files[0]);});
-Promise.all([refresh(),refreshSellerState()]).catch((err)=>{ $("dbCount").textContent="服務未連線"; showNotice(err.message,true); });
+Promise.all([refresh(),refreshSellerState(),refreshReviews()]).catch((err)=>{ $("dbCount").textContent="服務未連線"; showNotice(err.message,true); });

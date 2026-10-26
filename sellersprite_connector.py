@@ -65,7 +65,7 @@ def parse_card_text(text, product_url="", image_url=""):
         "price": parse_money(price_match.group(1)) if price_match else None,
         "rating": parse_money(rating_match.group(1)) if rating_match else None,
         "reviews": parse_money(rating_match.group(2)) if rating_match else None,
-        "rank": parse_money(rank_match.group(1)) if rank_match else None,
+        "bsr_rank": parse_money(rank_match.group(1)) if rank_match else None,
         "launch_date": date_match.group(1) if date_match else "",
         "product_url": product_url,
         "image_url": image_url,

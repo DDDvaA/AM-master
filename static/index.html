@@ -18,6 +18,7 @@
         <div class="side-label">工作区</div>
         <button class="nav-item active" data-view="research"><span>⌕</span>市场研究</button>
         <button class="nav-item" data-view="analysis"><span>▤</span>产品对照</button>
+        <button class="nav-item" data-view="reviews"><span>◎</span>评论洞察</button>
         <button class="nav-item" data-view="data"><span>▦</span>本地数据</button>
         <div class="side-divider"></div>
         <div class="side-label">数据范围</div>
@@ -46,7 +47,7 @@
             <div class="metric accent"><span>价格带 P75</span><strong id="metricPrice">--</strong><small>当前品类样本的高价位</small></div>
           </div>
           <div class="section-heading"><div><h2>机会商品</h2><p>按国家和三级分类查看，标签来自样本内分位数规则。</p></div><div class="table-tools"><select id="countryFilter"><option value="">所有国家</option></select><select id="tagFilter"><option value="">所有机会标签</option><option>高增长</option><option>流量款</option><option>利润款候选</option></select></div></div>
-          <div class="table-wrap"><table><thead><tr><th>商品</th><th>市场</th><th>价格</th><th>月销量</th><th>月销额</th><th>增长</th><th>评分 / 评论</th><th>机会类型</th><th>来源</th></tr></thead><tbody id="productRows"><tr><td colspan="9" class="empty-cell">暂无数据。先搜索公开商品页，或导入 SellerSprite / 市场数据文件。</td></tr></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>商品</th><th>市场</th><th>BSR</th><th>价格</th><th>月销量</th><th>月销额</th><th>增长</th><th>评分 / 评论</th><th>机会类型</th><th>来源</th></tr></thead><tbody id="productRows"><tr><td colspan="10" class="empty-cell">暂无数据。先同步同国家同三级类目的 BSR 数据，再用搜索页补足。</td></tr></tbody></table></div>
         </section>
         <section class="view" id="view-analysis">
           <div class="page-heading"><div><div class="eyebrow">PRODUCT FIT / 02</div><h1>产品功能对照</h1><p>粘贴产品资料，程序本地提取功能点，与已采集商品逐项比较并展示证据缺口。</p></div></div>
@@ -62,15 +63,28 @@
             <section class="analysis-results" id="analysisResults"><div class="empty-analysis"><div class="empty-symbol">⇄</div><h2>等待产品资料</h2><p>分析结果会把“有证据的差异”与“尚未核实的推断”分开，避免把竞品页面未提及误判成竞品没有该功能。</p></div></section>
           </div>
         </section>
+        <section class="view" id="view-reviews">
+          <div class="page-heading"><div><div class="eyebrow">VOICE OF CUSTOMER / 03</div><h1>七国真实评论洞察</h1><p>优先抽取同三级类目 BSR 商品；没有 BSR 时按现有竞品评论量选样。评论原文、星级、日期和链接均保存在本机。</p></div><button class="button secondary" id="refreshReviewsBtn">刷新分析</button></div>
+          <section class="query-panel">
+            <div class="query-title"><span class="step">03</span><div><h2>采集范围</h2><small>Amazon 出现登录或验证码时会打开可见 Edge 等待人工处理</small></div></div>
+            <label>三级分类<input id="reviewCategory" placeholder="例如：宠物用品 > 猫用品 > 自动喂食器"></label>
+            <div class="country-row compact"><span class="control-caption">目标市场</span><div id="reviewCountryChecks" class="country-checks"></div></div>
+            <div class="category-grid review-settings"><label>每国商品数<input id="reviewProductLimit" type="number" min="1" max="10" value="3"></label><label>每商品评论数<input id="reviewLimit" type="number" min="1" max="50" value="10"></label><button class="button primary review-run" id="reviewSyncBtn">抓取并分析评论</button></div>
+            <div id="reviewNotice" class="run-notice hidden"></div>
+          </section>
+          <div id="reviewSummary" class="review-country-grid"></div>
+          <div class="section-heading"><div><h2>评论原文样本</h2><p>保留原语言，不以翻译内容替换来源证据。</p></div><select id="reviewCountryFilter"><option value="">所有国家</option></select></div>
+          <div class="table-wrap"><table><thead><tr><th>国家 / 商品</th><th>星级</th><th>评论标题与原文</th><th>日期</th><th>验证 / 有用</th><th>主题</th><th>来源</th></tr></thead><tbody id="reviewRows"><tr><td colspan="7" class="empty-cell">尚未采集评论</td></tr></tbody></table></div>
+        </section>
         <section class="view" id="view-data">
-          <div class="page-heading"><div><div class="eyebrow">LOCAL DATA / 03</div><h1>数据管理</h1><p>导入历史研究数据，查看本机缓存规模；来源字段随每条记录保留。</p></div><button class="button secondary" id="exportBtn2">↓ 导出 Excel</button></div>
+          <div class="page-heading"><div><div class="eyebrow">LOCAL DATA / 04</div><h1>数据管理</h1><p>导入历史研究数据，查看本机缓存规模；来源字段随每条记录保留。</p></div><button class="button secondary" id="exportBtn2">↓ 导出 Excel</button></div>
           <div class="data-grid">
           <section class="query-panel"><div class="query-title"><span class="step">A</span><div><h2>导入数据文件</h2><small>支持 SellerSprite 和自有市场数据</small></div></div><div class="drop-zone" id="dropZone"><div class="upload-icon">↑</div><strong>选择 CSV 或 Excel 文件</strong><span>支持 .csv、.xlsx、.xlsm</span><input type="file" id="fileInput" accept=".csv,.xlsx,.xlsm"></div><p class="fineprint">识别国家、三级类目、ASIN、标题、价格、销量、销售额、增长率、评分、评论数和图片链接。未映射列不会推断。<a href="/static/sample_import_template.csv" download>下载导入模板</a></p><div id="importNotice" class="import-notice"></div></section>
             <section class="query-panel data-status"><div class="query-title"><span class="step">B</span><div><h2>本机存储</h2><small>数据库和原始页面均留在本机</small></div></div><dl><div><dt>数据目录</dt><dd id="dataPath">--</dd></div><div><dt>商品记录</dt><dd id="dataProducts">0</dd></div><div><dt>已覆盖国家</dt><dd id="dataCountries">0 / 7</dd></div><div><dt>最近更新</dt><dd id="dataLatest">--</dd></div></dl><div class="privacy-note">无 token / 云推理调用。公开页面访问可能受站点限制；遇到验证码、登录墙或拦截时会停止并记录，不绕过访问控制。</div></section>
             <section class="query-panel connector-panel"><div class="query-title"><span class="step">C</span><div><h2>卖家精灵授权同步</h2><small>使用独立可见浏览器和本机会话，不保存账号密码</small></div></div><div class="connector-actions"><button class="button secondary" id="sellerLoginBtn">打开登录窗口</button><span id="sellerProfileState" class="helper">尚未检查登录会话</span></div><label>卖家精灵结果页 URL<input id="sellerUrl" placeholder="粘贴查竞品或选市场结果页的完整 https 地址"></label><label>三级分类<input id="sellerCategory" placeholder="例如：宠物用品 > 猫用品 > 自动喂食器"></label><div class="connector-actions"><button class="button primary" id="sellerSyncBtn">同步最多 100 个去重商品</button><span class="helper">只读取你有权限查看的页面，不点击付费导出。</span></div><div id="sellerNotice" class="run-notice hidden"></div><p class="fineprint">首次登录时请在弹出的 Edge 中自行输入账号、密码和验证码。会话保存在 D 盘本地浏览器配置中；遇到安全验证会暂停，不绕过访问控制。</p></section>
           </div>
           <div class="section-heading"><div><h2>缓存商品</h2><p>图片取自来源页面，原始页面快照保存在配置的数据目录。</p></div></div>
-          <div class="table-wrap"><table><thead><tr><th>商品</th><th>国家</th><th>三级分类</th><th>价格</th><th>销量</th><th>销售额</th><th>评分</th><th>来源</th></tr></thead><tbody id="dataRows"><tr><td colspan="8" class="empty-cell">还没有缓存记录</td></tr></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>商品</th><th>国家</th><th>三级分类</th><th>BSR</th><th>价格</th><th>销量</th><th>销售额</th><th>评分</th><th>来源</th></tr></thead><tbody id="dataRows"><tr><td colspan="9" class="empty-cell">还没有缓存记录</td></tr></tbody></table></div>
         </section>
         <footer><span>AM master</span><span>本地规则分析 · 来源可追溯 · 无云端模型依赖</span></footer>
       </main>

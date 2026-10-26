@@ -13,10 +13,21 @@ os.environ["AM_MASTER_DATA_DIR"] = TEMP_DATA.name
 os.environ["AM_MASTER_AMAZON_BROWSER_RECOVERY"] = "0"
 
 import app
+import amazon_browser_connector
+import amazon_review_connector
 import sellersprite_connector
 
 
 class AnalysisTests(unittest.TestCase):
+    def test_amazon_browser_recognizes_localized_and_link_based_results(self):
+        self.assertTrue(amazon_browser_connector._is_challenge("Geben Sie die Zeichen ein validateCaptcha"))
+        self.assertTrue(amazon_browser_connector._same_search_page("https://www.amazon.de/s?k=futter", "https://www.amazon.de/s?k=feeder"))
+        markup = amazon_browser_connector._cards_to_markup([{"asin":"B000000001", "title":"Cat & Dog feeder", "href":"https://www.amazon.de/dp/B000000001", "image":"https://img.example/1.jpg", "price":"49,99"}])
+        parser = app.AmazonSearchParser("https://www.amazon.de")
+        parser.feed(markup)
+        self.assertEqual("B000000001", parser.items[0]["asin"])
+        self.assertEqual("Cat & Dog feeder", parser.items[0]["title"])
+
     def test_sellersprite_card_parser_extracts_authorized_metrics(self):
         text = "A+ V AC Yuposl Automatic Cat Feeder, 3L Cat Food Dispenser B0FCM74WM2 FBA 卖家: 2 卖家: Petfit Home CA 品牌: Yuposl #204 in Pet Supplies #1 in Automatic Cat Feeders 销量(父): 2,023 子体销量: 1K+ 销售额: C$91,075 变体数: 7 价格: C$47.99 评分/评分数: 4.3 / 4,760 上架时间: 2025-08-14"
         row = sellersprite_connector.parse_card_text(text, "https://www.amazon.ca/dp/B0FCM74WM2")
@@ -27,6 +38,7 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(47.99, row["price"])
         self.assertEqual(4.3, row["rating"])
         self.assertEqual(4760.0, row["reviews"])
+        self.assertEqual(204.0, row["bsr_rank"])
 
     def test_sellersprite_url_requires_supported_market(self):
         _parsed, market = sellersprite_connector.validate_sellersprite_url("https://www.sellersprite.com/v3/competitor-lookup/?market=CA&page=1")
@@ -52,6 +64,89 @@ class AnalysisTests(unittest.TestCase):
         self.assertIn("流量款", tagged[0]["opportunity_tags"])
         self.assertEqual([], tagged[2]["opportunity_tags"])
 
+    def test_review_theme_detection_and_summary(self):
+        themes = app.review_themes("WiFi timeout", "The app goes offline and the portion is too large")
+        self.assertIn("APP与连接", themes)
+        self.assertIn("份量准确", themes)
+        app.save_reviews([{
+            "country":"DE","asin":"B012345678","product_title":"Feeder","review_id":"R1",
+            "rating":2.0,"review_title":"App timeout","review_body":"WiFi connection failed and portion too large",
+            "review_date_text":"Reviewed in Germany","verified":1,"helpful_count":3,"reviewer":"A",
+            "review_url":"https://www.amazon.de/gp/customer-reviews/R1","source":"Amazon product reviews","collected_at":"2026-10-26T00:00:00+00:00",
+        }])
+        summary = next(item for item in app.review_summary("DE") if item["country"] == "DE")
+        self.assertEqual(1, summary["sample_count"])
+        self.assertEqual(1, summary["negative_count"])
+        self.assertTrue(any(item["theme"] == "APP与连接" for item in summary["themes"]))
+
+    def test_public_product_review_parser(self):
+        markup = '''<div data-hook="review"><a data-csa-c-slot-id="customer_review-RABC123_1_profile"><span class="a-profile-name">Buyer</span></a><i data-hook="review-star-rating"><span class="a-icon-alt">2 out of 5 stars</span></i><a href="/portal/customer-reviews/srp/-/RABC123"><h5 data-hook="reviewTitle">Connection issue</h5></a><span data-hook="review-date">Reviewed in Germany</span><span data-hook="avp-badge">Verified Purchase</span><div data-hook="reviewRichContentContainer"><p><span>WiFi timeout and portion too large.</span></p></div></div>'''
+        rows = amazon_review_connector.parse_public_product_reviews(markup, "https://www.amazon.de")
+        self.assertEqual(1, len(rows))
+        self.assertEqual("RABC123", rows[0]["review_id"])
+        self.assertEqual("Connection issue", rows[0]["title"])
+        self.assertIn("WiFi timeout", rows[0]["body"])
+
+    def test_review_product_selection_prefers_bsr(self):
+        base = {"country":"IT","category_path":"Pet > Cat > Feeder","source_date":"2026-10-26T00:00:00+00:00","brand":"Brand","price":50,"currency":"EUR","units":None,"revenue":None,"growth":None,"rating":4.2,"reviews":100,"image_url":"","source":"Amazon public search"}
+        app.save_products([{**base,"asin":"B011111111","title":"Popular feeder","bsr_rank":None,"product_url":"https://www.amazon.it/dp/B011111111"},{**base,"asin":"B022222222","title":"BSR feeder","bsr_rank":5,"reviews":10,"product_url":"https://www.amazon.it/dp/B022222222"}])
+        chosen = app.choose_review_products("IT","Pet > Cat > Feeder",2)
+        self.assertEqual("B022222222", chosen[0]["asin"])
+
+    def test_review_product_selection_excludes_litter_accessories(self):
+        base = {"country":"DE","category_path":"Pet Supplies > Cats > Litter Boxes","source_date":"2026-10-26T00:00:00+00:00","brand":"Brand","price":200,"currency":"EUR","units":None,"revenue":None,"growth":None,"rating":4.2,"reviews":100,"image_url":"","source":"Amazon public search","bsr_rank":None}
+        app.save_products([
+            {**base,"asin":"B033333333","title":"100 Bags for Automatic Litter Box Replacement Liner","reviews":5000,"product_url":"https://www.amazon.de/dp/B033333333"},
+            {**base,"asin":"B044444444","title":"Selbstreinigende Katzentoilette mit APP und Sicherheitssensor","reviews":200,"product_url":"https://www.amazon.de/dp/B044444444"},
+        ])
+        chosen = app.choose_review_products("DE","Pet Supplies > Cats > Litter Boxes",1)
+        self.assertEqual("B044444444", chosen[0]["asin"])
+
+    def test_litter_review_themes_are_detected(self):
+        themes = app.review_themes("Unsafe cycle", "The cat was nearly pinched, litter leaks everywhere and the waste drawer smells", "Pet Supplies > Cats > Litter Boxes")
+        self.assertIn("安全与防夹", themes)
+        self.assertIn("漏砂与带砂", themes)
+        self.assertIn("除臭与集便仓", themes)
+        self.assertNotIn("出粮可靠性", themes)
+
+    def test_litter_product_classification_requires_automated_machine(self):
+        self.assertEqual(
+            "qualified",
+            app.classify_litter_product_title("Self-Cleaning Smart Litter Box with App")["status"],
+        )
+        self.assertEqual(
+            "excluded_accessory",
+            app.classify_litter_product_title("100 Waste Bags for Automatic Litter Box")["status"],
+        )
+        self.assertEqual(
+            "excluded_accessory",
+            app.classify_litter_product_title("Deodorization Box Compatible with Self-Cleaning Cat Litter Box")["status"],
+        )
+        self.assertEqual(
+            "excluded_accessory",
+            app.classify_litter_product_title("Petivity Smart Litter Box Monitor")["status"],
+        )
+        self.assertEqual(
+            "excluded_manual",
+            app.classify_litter_product_title("Omega Paw Roll 'n Clean Self-Cleaning Litter Box")["status"],
+        )
+        self.assertEqual(
+            "unconfirmed",
+            app.classify_litter_product_title("Large Open Cat Litter Box")["status"],
+        )
+        self.assertEqual(
+            "qualified",
+            app.classify_litter_product_title("Automatic Self-Cleaning Litter Box with Waste Bags and Mat")["status"],
+        )
+        self.assertEqual(
+            "excluded_accessory",
+            app.classify_litter_product_title("80 Count Waste Bags for Self-Cleaning Litter Box")["status"],
+        )
+        self.assertEqual(
+            "excluded_accessory",
+            app.classify_litter_product_title("Self-Cleaning Cat Litter Box Tray Refills 3-Pack")["status"],
+        )
+
     def test_country_mapping(self):
         self.assertEqual("CA", app.canonical_country("加拿大"))
         self.assertEqual("DE", app.canonical_country("DE"))
@@ -64,6 +159,26 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual("B012345678", parser.items[0]["asin"])
         self.assertEqual("Sample feeder", parser.items[0]["title"])
         self.assertEqual("https://www.amazon.ca/dp/B012345678", parser.items[0]["product_url"])
+        self.assertEqual(49.0, parser.items[0]["price"])
+        self.assertEqual(4.4, parser.items[0]["rating"])
+        self.assertEqual(321.0, parser.items[0]["reviews"])
+
+    def test_public_search_parser_ignores_duplicate_metrics_and_expands_compact_reviews(self):
+        markup = '''<div data-component-type="s-search-result" data-asin="B012345671"><h2><span>Smart litter box</span></h2><a href="/dp/B012345671"></a><span class="a-price-whole">80</span><span class="a-price-whole">80</span><span class="a-icon-alt">4.5 out of 5 stars</span><span class="a-icon-alt">4.5 out of 5 stars</span><span class="s-underline-text">1.2K</span><span class="s-underline-text">1.2K</span></div>'''
+        parser = app.AmazonSearchParser("https://www.amazon.com")
+        parser.feed(markup)
+        self.assertEqual(80.0, parser.items[0]["price"])
+        self.assertEqual(4.5, parser.items[0]["rating"])
+        self.assertEqual(1200.0, parser.items[0]["reviews"])
+
+    def test_public_search_parser_reads_actual_currency_and_localized_thousands(self):
+        markup = '''<div data-component-type="s-search-result" data-asin="B012345672"><h2><span>Automatic litter box</span></h2><a href="/dp/B012345672"></a><span class="a-offscreen">CNY 1,600.65</span><span class="a-price-whole">1,600</span><span class="a-price-fraction">65</span><span class="a-icon-alt">4,2 de 5 estrellas</span><span class="s-underline-text">1,7 mil</span></div>'''
+        parser = app.AmazonSearchParser("https://www.amazon.es")
+        parser.feed(markup)
+        self.assertEqual(1600.65, parser.items[0]["price"])
+        self.assertEqual("CNY", parser.items[0]["currency"])
+        self.assertEqual(4.2, parser.items[0]["rating"])
+        self.assertEqual(1700.0, parser.items[0]["reviews"])
 
     def test_public_search_parser_accepts_modern_h2_title(self):
         markup = '''<div data-component-type="s-search-result" data-asin="B012345679"><h2><span>Modern title markup</span></h2><a href="/dp/B012345679"><img src="https://img.example/new.jpg"></a></div>'''
@@ -171,12 +286,19 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual("B012345698", products[0]["asin"])
         self.assertEqual("Amazon cached public search", products[0]["source"])
 
-    def test_authorized_category_cache_can_fill_amazon_gap(self):
-        base = {"country":"FR", "category_path":"Pet > Cat > Feeder", "source_date":"2026-10-23T00:00:00+00:00", "title":"Authorized feeder", "brand":"Brand", "price":79.0, "currency":"EUR", "units":300.0, "revenue":23700.0, "growth":None, "rating":4.4, "reviews":100.0, "image_url":"", "product_url":"https://www.amazon.fr/dp/B077777777", "asin":"B077777777"}
+    def test_bsr_category_cache_is_selected_before_search_results(self):
+        base = {"country":"FR", "category_path":"Pet > Cat > Feeder", "source_date":"2026-10-23T00:00:00+00:00", "title":"Authorized feeder", "brand":"Brand", "price":79.0, "currency":"EUR", "units":300.0, "revenue":23700.0, "growth":None, "rating":4.4, "reviews":100.0, "bsr_rank":12, "image_url":"", "product_url":"https://www.amazon.fr/dp/B077777777", "asin":"B077777777"}
         app.save_products([{**base, "source":"SellerSprite authorized browser"}])
-        rows = app.load_authorized_category_products("FR", "Pet > Cat > Feeder")
+        rows = app.load_bsr_category_products("FR", "Pet > Cat > Feeder")
         self.assertEqual(1, len(rows))
         self.assertEqual("B077777777", rows[0]["asin"])
+        search_rows = [
+            {**base, "source":"Amazon public search", "title":"Duplicate search version", "bsr_rank":None},
+            {**base, "source":"Amazon public search", "asin":"B077777778", "product_url":"https://www.amazon.fr/dp/B077777778", "title":"Search-only feeder", "bsr_rank":None},
+        ]
+        merged = app.merge_bsr_then_search(rows, search_rows)
+        self.assertEqual(["B077777777", "B077777778"], [row["asin"] for row in merged])
+        self.assertEqual("SellerSprite authorized browser", merged[0]["source"])
 
     def test_page_issue_identifies_amazon_verification(self):
         self.assertIn("风控验证页", app.detect_page_issue(b"<meta http-equiv='refresh' content='bm-verify=abc'>"))
